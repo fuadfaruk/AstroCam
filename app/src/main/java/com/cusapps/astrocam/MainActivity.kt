@@ -201,6 +201,18 @@ class MainActivity : AppCompatActivity() {
         captureNext()
     }
 
+    private fun flashScreen() {
+        viewBinding.flashOverlay.visibility = View.VISIBLE
+        viewBinding.flashOverlay.alpha = 0.5f
+        viewBinding.flashOverlay.animate()
+            .alpha(0f)
+            .setDuration(100)
+            .withEndAction {
+                viewBinding.flashOverlay.visibility = View.GONE
+            }
+            .start()
+    }
+
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun takePhoto(onComplete: (Boolean) -> Unit = {}) {
         val imageCapture = imageCapture ?: run {
@@ -224,6 +236,17 @@ class MainActivity : AppCompatActivity() {
             .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
             .build()
 
+        // Apply manual settings BEFORE capture if manual mode is on
+        // This ensures the capture request uses the intended long exposure
+        if (viewBinding.manualModeSwitch.isChecked) {
+            val shutterSpeed = getShutterSpeed()
+            val camera2CameraControl = Camera2CameraControl.from(camera!!.cameraControl)
+            applyManualSettings(camera2CameraControl, viewBinding.isoSeekBar.progress, shutterSpeed, getFocusDistance(), true)
+        }
+
+        // Flash the screen
+        flashScreen()
+
         // Set up image capture listener, which is triggered after photo has been taken
         imageCapture.takePicture(
             outputOptions,
@@ -232,26 +255,26 @@ class MainActivity : AppCompatActivity() {
                 override fun onError(exc: ImageCaptureException) {
                     Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
                     Toast.makeText(baseContext, "Capture failed: ${exc.message}", Toast.LENGTH_SHORT).show()
+                    restorePreviewSettings()
                     onComplete(false)
                 }
 
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                     val msg = "Photo capture succeeded: ${output.savedUri}"
                     Log.d(TAG, msg)
-                    // Toast.makeText(baseContext, msg, Toast.LENGTH_SHORT).show()
+                    restorePreviewSettings()
                     onComplete(true)
+                }
+
+                private fun restorePreviewSettings() {
+                    // Revert to preview-friendly settings (capped shutter speed) after capture
+                    if (viewBinding.manualModeSwitch.isChecked) {
+                        val camera2CameraControl = Camera2CameraControl.from(camera!!.cameraControl)
+                        applyManualSettings(camera2CameraControl, viewBinding.isoSeekBar.progress, getShutterSpeed(), getFocusDistance(), false)
+                    }
                 }
             }
         )
-
-        // Apply manual settings just for the capture if needed
-        if (viewBinding.manualModeSwitch.isChecked) {
-            val shutterSpeed = getShutterSpeed()
-            if (shutterSpeed >= 66_666_666L) { // 1/15s
-                val camera2CameraControl = Camera2CameraControl.from(camera!!.cameraControl)
-                applyManualSettings(camera2CameraControl, viewBinding.isoSeekBar.progress, shutterSpeed, getFocusDistance())
-            }
-        }
     }
 
     @SuppressLint("RestrictedApi", "ClickableViewAccessibility")
@@ -277,9 +300,9 @@ class MainActivity : AppCompatActivity() {
                     it.setSurfaceProvider(viewBinding.viewFinder.surfaceProvider)
                 }
 
-            // ImageCapture
+            // ImageCapture - Maximize quality for astro shots
             imageCapture = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
                 .setTargetAspectRatio(AspectRatio.RATIO_4_3)
                 .build()
 
@@ -345,23 +368,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun getShutterSpeed(): Long {
-        val characteristics = currentCharacteristics ?: return 0L
-        val exposureTimeRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-        val minExp = exposureTimeRange?.lower ?: 100_000L
-        val maxExp = exposureTimeRange?.upper ?: 1_000_000_000L
-        
-        val commonSpeeds = longArrayOf(
-            1_000_000L, 2_000_000L, 4_000_000L, 8_000_000L, 16_666_666L, 33_33_333L, 66_666_666L,
-            125_000_000L, 250_000_000L, 500_000_000L, 1_000_000_000L, 2_000_000_000L, 4_000_000_000L,
-            8_000_000_000L, 15_000_000_000L, 30_000_000_000L, 60_000_000_000L
-        )
-        val supportedSpeedsList = commonSpeeds.filter { it in minExp..maxExp }.toMutableList()
-        if (supportedSpeedsList.isEmpty() || maxExp > (supportedSpeedsList.lastOrNull() ?: 0L)) {
-            supportedSpeedsList.add(maxExp)
-        }
-        val shutterSpeeds = supportedSpeedsList.toLongArray()
-
-        return shutterSpeeds[viewBinding.shutterSpeedSeekBar.progress]
+        val shutterSpeeds = getShutterSpeedsArray()
+        if (shutterSpeeds.isEmpty()) return 0L
+        val progress = viewBinding.shutterSpeedSeekBar.progress
+        return if (progress in shutterSpeeds.indices) shutterSpeeds[progress] else shutterSpeeds.last()
     }
 
     private fun getFocusDistance(): Float {
@@ -448,7 +458,7 @@ class MainActivity : AppCompatActivity() {
         val maxExp = exposureTimeRange?.upper ?: 1_000_000_000L
 
         val commonSpeeds = longArrayOf(
-            1_000_000L, 2_000_000L, 4_000_000L, 8_000_000L, 16_666_666L, 33_33_333L, 66_666_666L,
+            1_000_000L, 2_000_000L, 4_000_000L, 8_000_000L, 16_666_666L, 33_333_333L, 66_666_666L,
             125_000_000L, 250_000_000L, 500_000_000L, 1_000_000_000L, 2_000_000_000L, 4_000_000_000L,
             8_000_000_000L, 15_000_000_000L, 30_000_000_000L, 60_000_000_000L
         )
@@ -460,15 +470,22 @@ class MainActivity : AppCompatActivity() {
     }
 
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
-    private fun applyManualSettings(camera2CameraControl: Camera2CameraControl, iso: Int, shutterSpeed: Long, focusDistance: Float) {
+    private fun applyManualSettings(camera2CameraControl: Camera2CameraControl, iso: Int, shutterSpeed: Long, focusDistance: Float, forceShutter: Boolean = false) {
         val builder = CaptureRequestOptions.Builder()
             .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
             .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
             .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
             .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
 
-        if (shutterSpeed < 66_666_666L) { // 1/15s
+        // For long exposures, we need to set both exposure time and frame duration.
+        // We cap the preview (non-forced) at ~1/15s to keep it responsive.
+        if (forceShutter || shutterSpeed < 66_666_666L) { 
             builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, shutterSpeed)
+            builder.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, shutterSpeed)
+        } else {
+            // Cap preview shutter speed to ~1/15s if the actual setting is longer
+            builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, 66_666_666L)
+            builder.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, 66_666_666L)
         }
         
         camera2CameraControl.captureRequestOptions = builder.build()
