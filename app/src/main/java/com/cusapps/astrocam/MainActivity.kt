@@ -9,6 +9,7 @@ import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.media.MediaActionSound
 import android.os.Build
 import android.os.Bundle
 import android.os.CountDownTimer
@@ -28,17 +29,19 @@ import androidx.camera.camera2.interop.Camera2CameraControl
 import androidx.camera.camera2.interop.Camera2CameraInfo
 import androidx.camera.camera2.interop.CaptureRequestOptions
 import androidx.camera.camera2.interop.ExperimentalCamera2Interop
-import androidx.camera.core.AspectRatio
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.FocusMeteringAction
 import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
+import androidx.camera.core.resolutionselector.AspectRatioStrategy
+import androidx.camera.core.resolutionselector.ResolutionSelector
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.isVisible
 import com.cusapps.astrocam.databinding.ActivityMainBinding
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -56,20 +59,19 @@ class MainActivity : AppCompatActivity() {
 
     private lateinit var cameraExecutor: ExecutorService
     private var mediaSession: MediaSessionCompat? = null
+    
+    private val shutterSound = MediaActionSound()
+    
+    // Flag to detect if app was minimized by user (Home button, Recents)
+    private var userMinimized = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         viewBinding = ActivityMainBinding.inflate(layoutInflater)
         setContentView(viewBinding.root)
 
-        // Request camera permissions
-        if (allPermissionsGranted()) {
-            startCamera()
-        } else {
-            ActivityCompat.requestPermissions(
-                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
-            )
-        }
+        // Preload shutter sound
+        shutterSound.load(MediaActionSound.SHUTTER_CLICK)
 
         // Set up the listeners for take photo button
         viewBinding.imageCaptureButton.setOnClickListener { startPhotoTimer() }
@@ -89,20 +91,77 @@ class MainActivity : AppCompatActivity() {
         setupRetractableControls()
     }
 
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        userMinimized = true
+    }
+
+    override fun onStart() {
+        super.onStart()
+        userMinimized = false
+        
+        // Stop the background service when app returns to foreground
+        if (!isChangingConfigurations) {
+            stopCameraService()
+        }
+        
+        // Re-bind camera to ensure it's fresh and bound to this lifecycle.
+        // This fixes the "Not bound to a valid camera" error when returning from background.
+        if (allPermissionsGranted()) {
+            startCamera()
+        } else {
+            ActivityCompat.requestPermissions(
+                this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS
+            )
+        }
+    }
+
+    override fun onStop() {
+        super.onStop()
+        // Only start background service if:
+        // 1. Manual mode is enabled
+        // 2. The app is NOT being minimized (userMinimized is false when screen is locked)
+        // 3. The app is NOT being exited/finished
+        // 4. It's not a configuration change (rotation)
+        if (viewBinding.manualModeSwitch.isChecked && !userMinimized && !isFinishing && !isChangingConfigurations) {
+            startCameraService()
+        }
+    }
+
+    private fun startCameraService() {
+        val intent = Intent(this, CameraService::class.java).apply {
+            action = CameraService.ACTION_UPDATE_SETTINGS
+            putExtra(CameraService.EXTRA_MANUAL_MODE, viewBinding.manualModeSwitch.isChecked)
+            putExtra(CameraService.EXTRA_ISO, viewBinding.isoSeekBar.progress)
+            putExtra(CameraService.EXTRA_SHUTTER, getShutterSpeed())
+            putExtra(CameraService.EXTRA_FOCUS, getFocusDistance())
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+        // Disable local media session to let service handle button events
+        mediaSession?.isActive = false
+    }
+
+    private fun stopCameraService() {
+        val intent = Intent(this, CameraService::class.java)
+        stopService(intent)
+        // Re-enable local media session
+        mediaSession?.isActive = true
+    }
+
     private fun setupRetractableControls() {
         viewBinding.toggleControlsButton.setOnClickListener {
-            if (viewBinding.controls.visibility == View.VISIBLE) {
-                viewBinding.controls.visibility = View.GONE
-            } else {
-                viewBinding.controls.visibility = View.VISIBLE
-            }
+            viewBinding.controls.isVisible = !viewBinding.controls.isVisible
         }
     }
 
     private fun setupTimerControl() {
         viewBinding.timerSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                viewBinding.timerValueText.text = "${progress}s"
+                viewBinding.timerValueText.text = getString(R.string.timer_seconds, progress)
             }
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
@@ -123,21 +182,20 @@ class MainActivity : AppCompatActivity() {
         mediaSession = MediaSessionCompat(this, TAG).apply {
             setCallback(object : MediaSessionCompat.Callback() {
                 override fun onMediaButtonEvent(mediaButtonEvent: Intent?): Boolean {
-                    val keyEvent = mediaButtonEvent?.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
+                    val keyEvent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                        mediaButtonEvent?.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
+                    } else {
+                        @Suppress("DEPRECATION")
+                        mediaButtonEvent?.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
+                    }
                     if (keyEvent?.action == KeyEvent.ACTION_DOWN) {
                         startPhotoTimer()
                         return true
                     }
                     return super.onMediaButtonEvent(mediaButtonEvent)
                 }
-
-                override fun onPlay() {
-                    startPhotoTimer()
-                }
-
-                override fun onPause() {
-                    startPhotoTimer()
-                }
+                override fun onPlay() = startPhotoTimer()
+                override fun onPause() = startPhotoTimer()
             })
 
             val state = PlaybackStateCompat.Builder()
@@ -163,7 +221,7 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
-        viewBinding.timerText.visibility = View.VISIBLE
+        viewBinding.timerText.isVisible = true
         object : CountDownTimer((timerSeconds * 1000).toLong(), 1000) {
             override fun onTick(millisUntilFinished: Long) {
                 val secondsRemaining = (millisUntilFinished / 1000) + 1
@@ -171,7 +229,7 @@ class MainActivity : AppCompatActivity() {
             }
 
             override fun onFinish() {
-                viewBinding.timerText.visibility = View.GONE
+                viewBinding.timerText.isVisible = false
                 takeBurstPhotos()
             }
         }.start()
@@ -202,13 +260,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun flashScreen() {
-        viewBinding.flashOverlay.visibility = View.VISIBLE
+        viewBinding.flashOverlay.isVisible = true
         viewBinding.flashOverlay.alpha = 0.5f
         viewBinding.flashOverlay.animate()
             .alpha(0f)
             .setDuration(100)
             .withEndAction {
-                viewBinding.flashOverlay.visibility = View.GONE
+                viewBinding.flashOverlay.isVisible = false
             }
             .start()
     }
@@ -216,13 +274,21 @@ class MainActivity : AppCompatActivity() {
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun takePhoto(onComplete: (Boolean) -> Unit = {}) {
         val imageCapture = imageCapture ?: run {
+            Log.e(TAG, "ImageCapture is null")
+            onComplete(false)
+            return
+        }
+
+        if (camera == null) {
+            Log.e(TAG, "Camera is not bound to a lifecycle")
+            Toast.makeText(this, "Camera not ready", Toast.LENGTH_SHORT).show()
             onComplete(false)
             return
         }
 
         val name = SimpleDateFormat(FILENAME_FORMAT, Locale.US)
             .format(System.currentTimeMillis())
-        
+
         val contentValues = ContentValues().apply {
             put(MediaStore.MediaColumns.DISPLAY_NAME, name)
             put(MediaStore.MediaColumns.MIME_TYPE, "image/jpeg")
@@ -231,23 +297,19 @@ class MainActivity : AppCompatActivity() {
             }
         }
 
-        // Create output options object which contains file + metadata
         val outputOptions = ImageCapture.OutputFileOptions
             .Builder(contentResolver, MediaStore.Images.Media.EXTERNAL_CONTENT_URI, contentValues)
             .build()
 
-        // Apply manual settings BEFORE capture if manual mode is on
-        // This ensures the capture request uses the intended long exposure
         if (viewBinding.manualModeSwitch.isChecked) {
             val shutterSpeed = getShutterSpeed()
             val camera2CameraControl = Camera2CameraControl.from(camera!!.cameraControl)
             applyManualSettings(camera2CameraControl, viewBinding.isoSeekBar.progress, shutterSpeed, getFocusDistance(), true)
         }
 
-        // Flash the screen
-        flashScreen()
+        // Play shutter sound
+        shutterSound.play(MediaActionSound.SHUTTER_CLICK)
 
-        // Set up image capture listener, which is triggered after photo has been taken
         imageCapture.takePicture(
             outputOptions,
             ContextCompat.getMainExecutor(this),
@@ -259,16 +321,15 @@ class MainActivity : AppCompatActivity() {
                     onComplete(false)
                 }
 
-                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    val msg = "Photo capture succeeded: ${output.savedUri}"
-                    Log.d(TAG, msg)
+                override fun onImageSaved(output: ImageCapture.OutputFileResults){
+                    flashScreen()
+                    Log.d(TAG, "Photo capture succeeded")
                     restorePreviewSettings()
                     onComplete(true)
                 }
 
                 private fun restorePreviewSettings() {
-                    // Revert to preview-friendly settings (capped shutter speed) after capture
-                    if (viewBinding.manualModeSwitch.isChecked) {
+                    if (viewBinding.manualModeSwitch.isChecked && camera != null) {
                         val camera2CameraControl = Camera2CameraControl.from(camera!!.cameraControl)
                         applyManualSettings(camera2CameraControl, viewBinding.isoSeekBar.progress, getShutterSpeed(), getFocusDistance(), false)
                     }
@@ -283,7 +344,6 @@ class MainActivity : AppCompatActivity() {
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
         cameraProviderFuture.addListener({
-            // Used to bind the lifecycle of cameras to the lifecycle owner
             val cameraProvider: ProcessCameraProvider = try {
                 cameraProviderFuture.get()
             } catch (e: Exception) {
@@ -292,40 +352,36 @@ class MainActivity : AppCompatActivity() {
             }
             viewBinding.viewFinder.scaleType = PreviewView.ScaleType.FIT_CENTER
 
-            // Preview
+            val resolutionSelector = ResolutionSelector.Builder()
+                .setAspectRatioStrategy(AspectRatioStrategy.RATIO_4_3_FALLBACK_AUTO_STRATEGY)
+                .build()
+
             val preview = Preview.Builder()
-                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .setResolutionSelector(resolutionSelector)
                 .build()
                 .also {
-                    it.setSurfaceProvider(viewBinding.viewFinder.surfaceProvider)
+                    it.surfaceProvider = viewBinding.viewFinder.surfaceProvider
                 }
 
-            // ImageCapture - Maximize quality for astro shots
             imageCapture = ImageCapture.Builder()
                 .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
+                .setResolutionSelector(resolutionSelector)
                 .build()
 
-            // Select back camera as a default
             val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
             try {
-                // Unbind use cases before rebinding
                 cameraProvider.unbindAll()
 
-                // Bind use cases to camera
                 val camera = cameraProvider.bindToLifecycle(
                     this, cameraSelector, preview, imageCapture
                 )
                 this.camera = camera
                 
-                // Add Tap to Focus
                 viewBinding.viewFinder.setOnTouchListener { _, event ->
                     when (event.action) {
                         MotionEvent.ACTION_DOWN -> true
                         MotionEvent.ACTION_UP -> {
-                            Log.d(TAG, "Tap detected at ${event.x}, ${event.y}")
-                            // If manual mode is on, we don't want to override focus
                             if (!viewBinding.manualModeSwitch.isChecked) {
                                 val factory = viewBinding.viewFinder.meteringPointFactory
                                 val point = factory.createPoint(event.x, event.y)
@@ -333,16 +389,7 @@ class MainActivity : AppCompatActivity() {
                                     .setAutoCancelDuration(3, TimeUnit.SECONDS)
                                     .build()
                                 
-                                Log.d(TAG, "Starting focus and metering...")
-                                camera.cameraControl.startFocusAndMetering(action).addListener({
-                                    try {
-                                        Log.d(TAG, "Focus and metering completed")
-                                    } catch (e: Exception) {
-                                        Log.e(TAG, "Focus and metering failed", e)
-                                    }
-                                }, ContextCompat.getMainExecutor(this))
-                            } else {
-                                Log.d(TAG, "Tap to focus ignored: Manual mode is active")
+                                camera.cameraControl.startFocusAndMetering(action)
                             }
                             viewBinding.viewFinder.performClick()
                             true
@@ -351,17 +398,14 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-                // Fetch and store native camera properties for manual controls
                 val cameraInfo = camera.cameraInfo
                 currentCameraId = Camera2CameraInfo.from(cameraInfo).cameraId
-                val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                val cameraManager = getSystemService(CAMERA_SERVICE) as CameraManager
                 currentCharacteristics = cameraManager.getCameraCharacteristics(currentCameraId!!)
 
                 setupManualControls()
-                Log.d(TAG, "Camera preview and capture bound successfully")
             } catch(exc: Exception) {
                 Log.e(TAG, "Use case binding failed", exc)
-                Toast.makeText(this, "Error starting camera: ${exc.message}", Toast.LENGTH_SHORT).show()
             }
 
         }, ContextCompat.getMainExecutor(this))
@@ -377,7 +421,7 @@ class MainActivity : AppCompatActivity() {
     private fun getFocusDistance(): Float {
         val characteristics = currentCharacteristics ?: return 0f
         val minFocus = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
-        return (1.0f - viewBinding.focusDistanceSeekBar.progress / 100f) * minFocus
+        return CameraUtils.calculateFocusDistance(viewBinding.focusDistanceSeekBar.progress, minFocus)
     }
 
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
@@ -386,18 +430,12 @@ class MainActivity : AppCompatActivity() {
         val characteristics = currentCharacteristics ?: return
         val camera2CameraControl = Camera2CameraControl.from(cameraControl)
 
-        // Range Queries using native android.hardware.camera2 API
-        val exposureTimeRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
         val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
-
         val minIso = isoRange?.lower ?: 100
         val maxIso = isoRange?.upper ?: 3200
 
-        // Shutter Speed setup
         val shutterSpeeds = getShutterSpeedsArray()
-        val shutterSpeedLabels = shutterSpeeds.map { ns ->
-            if (ns >= 1_000_000_000L) "${ns / 1_000_000_000L}s" else "1/${1_000_000_000L / ns}"
-        }.toTypedArray()
+        val shutterSpeedLabels = shutterSpeeds.map { CameraUtils.formatShutterSpeed(it) }.toTypedArray()
 
         viewBinding.shutterSpeedSeekBar.max = shutterSpeeds.size - 1
         viewBinding.shutterSpeedSeekBar.isEnabled = viewBinding.manualModeSwitch.isChecked
@@ -406,7 +444,6 @@ class MainActivity : AppCompatActivity() {
         viewBinding.isoSeekBar.max = maxIso
         viewBinding.isoSeekBar.isEnabled = viewBinding.manualModeSwitch.isChecked
 
-        // Focus setup (0.0 is infinity, minFocus is closest)
         viewBinding.focusDistanceSeekBar.max = 100
         viewBinding.focusDistanceSeekBar.isEnabled = viewBinding.manualModeSwitch.isChecked
 
@@ -422,9 +459,9 @@ class MainActivity : AppCompatActivity() {
                 viewBinding.focusDistanceValueText.text = String.format(Locale.US, "%.2f", getFocusDistance())
             } else {
                 applyAutoSettings(camera2CameraControl)
-                viewBinding.isoValueText.text = "Auto"
-                viewBinding.shutterSpeedValueText.text = "Auto"
-                viewBinding.focusDistanceValueText.text = "Auto"
+                viewBinding.isoValueText.text = getString(R.string.auto)
+                viewBinding.shutterSpeedValueText.text = getString(R.string.auto)
+                viewBinding.focusDistanceValueText.text = getString(R.string.auto)
             }
         }
 
@@ -457,35 +494,29 @@ class MainActivity : AppCompatActivity() {
         val minExp = exposureTimeRange?.lower ?: 100_000L
         val maxExp = exposureTimeRange?.upper ?: 1_000_000_000L
 
-        val commonSpeeds = longArrayOf(
-            1_000_000L, 2_000_000L, 4_000_000L, 8_000_000L, 16_666_666L, 33_333_333L, 66_666_666L,
-            125_000_000L, 250_000_000L, 500_000_000L, 1_000_000_000L, 2_000_000_000L, 4_000_000_000L,
-            8_000_000_000L, 15_000_000_000L, 30_000_000_000L, 60_000_000_000L
-        )
-        val supportedSpeedsList = commonSpeeds.filter { it in minExp..maxExp }.toMutableList()
-        if (supportedSpeedsList.isEmpty() || maxExp > (supportedSpeedsList.lastOrNull() ?: 0L)) {
-            supportedSpeedsList.add(maxExp)
-        }
-        return supportedSpeedsList.toLongArray()
+        return CameraUtils.calculateShutterSpeeds(minExp, maxExp)
     }
 
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun applyManualSettings(camera2CameraControl: Camera2CameraControl, iso: Int, shutterSpeed: Long, focusDistance: Float, forceShutter: Boolean = false) {
         val builder = CaptureRequestOptions.Builder()
+            .setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
             .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
             .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
             .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
             .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
 
-        // For long exposures, we need to set both exposure time and frame duration.
-        // We cap the preview (non-forced) at ~1/15s to keep it responsive.
-        if (forceShutter || shutterSpeed < 66_666_666L) { 
+        if (forceShutter) {
             builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, shutterSpeed)
             builder.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, shutterSpeed)
         } else {
-            // Cap preview shutter speed to ~1/15s if the actual setting is longer
-            builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, 66_666_666L)
-            builder.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, 66_666_666L)
+            // For preview, limit exposure to avoid low frame rate (max 1/15s)
+            val previewShutter = shutterSpeed.coerceAtMost(66_666_666L)
+            builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, previewShutter)
+            // Ensure frame duration is at least as long as exposure time
+            // Also ensure it's at least 1/30s to keep preview smooth where possible
+            val frameDuration = previewShutter.coerceAtLeast(33_333_333L)
+            builder.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, frameDuration)
         }
         
         camera2CameraControl.captureRequestOptions = builder.build()
@@ -493,8 +524,6 @@ class MainActivity : AppCompatActivity() {
 
     @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
     private fun applyAutoSettings(camera2CameraControl: Camera2CameraControl) {
-        // Clearing Interop options by setting an empty builder
-        // This allows CameraX to take back control of AE/AF
         camera2CameraControl.captureRequestOptions = CaptureRequestOptions.Builder().build()
     }
 
@@ -506,6 +535,7 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         cameraExecutor.shutdown()
         mediaSession?.release()
+        shutterSound.release()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
@@ -528,7 +558,7 @@ class MainActivity : AppCompatActivity() {
             if (allPermissionsGranted()) {
                 startCamera()
             } else {
-                Toast.makeText(this, "Permissions not granted by the user.", Toast.LENGTH_SHORT).show()
+                Toast.makeText(this, "Permissions not granted.", Toast.LENGTH_SHORT).show()
                 finish()
             }
         }
@@ -539,11 +569,12 @@ class MainActivity : AppCompatActivity() {
         private const val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
         private const val REQUEST_CODE_PERMISSIONS = 10
         private val REQUIRED_PERMISSIONS =
-            mutableListOf(
-                Manifest.permission.CAMERA
-            ).apply {
+            mutableListOf(Manifest.permission.CAMERA).apply {
                 if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
                     add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                }
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                    add(Manifest.permission.POST_NOTIFICATIONS)
                 }
             }.toTypedArray()
     }
