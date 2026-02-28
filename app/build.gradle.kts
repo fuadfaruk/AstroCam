@@ -40,11 +40,7 @@ dependencies {
     implementation(libs.material)
     implementation(libs.androidx.constraintlayout)
 
-    implementation(libs.androidx.camera.core)
-    implementation(libs.androidx.camera.camera2)
-    implementation(libs.androidx.camera.lifecycle)
-    implementation(libs.androidx.camera.view)
-    implementation(libs.androidx.camera.extensions)
+    // CameraX dependencies removed in favor of Camera2 API
 
     implementation(libs.androidx.media)
     implementation(libs.androidx.lifecycle.service)

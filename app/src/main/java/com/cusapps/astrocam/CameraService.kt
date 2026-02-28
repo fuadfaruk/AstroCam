@@ -1,211 +1,236 @@
 package com.cusapps.astrocam
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
-import android.content.ContentValues
+import android.app.Service
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
-import android.hardware.camera2.CameraCharacteristics
-import android.hardware.camera2.CaptureRequest
+import android.graphics.ImageFormat
+import android.hardware.camera2.*
+import android.media.Image
+import android.media.ImageReader
 import android.media.MediaActionSound
-import android.os.Build
-import android.os.Handler
-import android.os.Looper
-import android.os.PowerManager
-import android.provider.MediaStore
+import android.os.*
 import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import android.view.KeyEvent
-import androidx.camera.camera2.interop.Camera2CameraControl
-import androidx.camera.camera2.interop.Camera2CameraInfo
-import androidx.camera.camera2.interop.CaptureRequestOptions
-import androidx.camera.camera2.interop.ExperimentalCamera2Interop
-import androidx.camera.core.AspectRatio
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
-import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.annotation.RequiresPermission
 import androidx.core.app.NotificationCompat
-import androidx.core.content.ContextCompat
-import androidx.lifecycle.LifecycleService
 import androidx.media.session.MediaButtonReceiver
-import java.io.File
-import java.text.SimpleDateFormat
-import java.util.Locale
+import java.util.*
+import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
-@ExperimentalCamera2Interop
-class CameraService : LifecycleService() {
+/**
+ * CameraService is a Foreground Service that allows the app to keep the camera active
+ * even when the screen is off. Reconstructed with Camera2 API.
+ * Now supports RAW capture.
+ */
+class CameraService : Service() {
 
-    private var imageCapture: ImageCapture? = null
     private var mediaSession: MediaSessionCompat? = null
     private var notificationManager: NotificationManager? = null
     private var notificationBuilder: NotificationCompat.Builder? = null
     private var wakeLock: PowerManager.WakeLock? = null
-    private var isDestroyed = false
     
     private val shutterSound = MediaActionSound()
     
-    // Manual settings state
     private var manualMode = false
+    private var rawMode = false
     private var iso = 400
-    private var shutterSpeed = 1_000_000_000L // 1s
+    private var shutterSpeed = 1_000_000_000L
     private var focusDistance = 0f
     
-    @OptIn(ExperimentalCamera2Interop::class)
-    private var cameraControl: Camera2CameraControl? = null
+    private var currentCameraId: String? = null
+    
+    private var cameraDevice: CameraDevice? = null
+    private var captureSession: CameraCaptureSession? = null
+    private var imageReader: ImageReader? = null
+    private var backgroundThread: HandlerThread? = null
+    private var backgroundHandler: Handler? = null
+    private val cameraOpenCloseLock = Semaphore(1)
+
+    // Maps to link images with their capture results for RAW DNG creation
+    private val captureResults = mutableMapOf<Long, TotalCaptureResult>()
+    private val capturedImages = mutableMapOf<Long, Image>()
 
     companion object {
         private const val TAG = "CameraService"
         private const val CHANNEL_ID = "CameraServiceChannel"
         private const val NOTIFICATION_ID = 1
-        private const val FILENAME_FORMAT = "yyyy-MM-dd-HH-mm-ss-SSS"
         
         const val ACTION_UPDATE_SETTINGS = "com.cusapps.astrocam.UPDATE_SETTINGS"
         const val EXTRA_MANUAL_MODE = "extra_manual_mode"
+        const val EXTRA_RAW_MODE = "extra_raw_mode"
         const val EXTRA_ISO = "extra_iso"
         const val EXTRA_SHUTTER = "extra_shutter"
         const val EXTRA_FOCUS = "extra_focus"
+        const val EXTRA_CAMERA_ID = "extra_camera_id"
     }
 
     override fun onCreate() {
         super.onCreate()
+        
+        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AstroCam:CaptureWakeLock")
+        
         notificationManager = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
         createNotificationChannel()
         val notification = createNotification()
         
-        // Preload shutter sound
         shutterSound.load(MediaActionSound.SHUTTER_CLICK)
-        
-        val powerManager = getSystemService(POWER_SERVICE) as PowerManager
-        wakeLock = powerManager.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "AstroCam:CaptureLock")
 
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(
-                NOTIFICATION_ID, 
-                notification, 
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA
-            )
+            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
         
-        startCamera()
+        startBackgroundThread()
         initializeMediaSession()
     }
 
+    private fun startBackgroundThread() {
+        backgroundThread = HandlerThread("CameraServiceBackground").also { it.start() }
+        backgroundHandler = Handler(backgroundThread!!.looper)
+    }
+
+    private fun stopBackgroundThread() {
+        backgroundThread?.quitSafely()
+        try {
+            backgroundThread?.join()
+            backgroundThread = null
+            backgroundHandler = null
+        } catch (e: InterruptedException) {
+            Log.e(TAG, "Interrupted while stopping background thread", e)
+        }
+    }
+
+    @RequiresPermission(Manifest.permission.CAMERA)
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         if (intent?.action == ACTION_UPDATE_SETTINGS) {
             manualMode = intent.getBooleanExtra(EXTRA_MANUAL_MODE, false)
+            rawMode = intent.getBooleanExtra(EXTRA_RAW_MODE, false)
             iso = intent.getIntExtra(EXTRA_ISO, 400)
             shutterSpeed = intent.getLongExtra(EXTRA_SHUTTER, 1_000_000_000L)
             focusDistance = intent.getFloatExtra(EXTRA_FOCUS, 0f)
-            Log.d(TAG, "Settings updated: Manual=$manualMode, ISO=$iso, Shutter=$shutterSpeed")
-            applyManualSettingsIfReady()
+            
+            val newCameraId = intent.getStringExtra(EXTRA_CAMERA_ID)
+            
+            if (newCameraId != null && newCameraId != currentCameraId) {
+                currentCameraId = newCameraId
+                closeCamera()
+                openCamera()
+            }
+
+            Log.d(TAG, "Settings updated: Manual=$manualMode, RAW=$rawMode, ISO=$iso, Shutter=$shutterSpeed")
         }
         MediaButtonReceiver.handleIntent(mediaSession, intent)
-        return super.onStartCommand(intent, flags, startId)
+        return START_NOT_STICKY
     }
 
-    private fun createNotificationChannel() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            val serviceChannel = NotificationChannel(
-                CHANNEL_ID,
-                "Camera Service Channel",
-                NotificationManager.IMPORTANCE_LOW
-            )
-            notificationManager?.createNotificationChannel(serviceChannel)
+    @RequiresPermission(Manifest.permission.CAMERA)
+    private fun openCamera() {
+        val cid = currentCameraId ?: return
+        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        try {
+            if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+                return
+            }
+            
+            val characteristics = manager.getCameraCharacteristics(cid)
+            val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
+            
+            val isRawSupported = characteristics.get(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES)
+                ?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW) ?: false
+            
+            val format = if (rawMode && isRawSupported) ImageFormat.RAW_SENSOR else ImageFormat.JPEG
+            val largest = Collections.max(map.getOutputSizes(format).toList(), CompareSizesByArea())
+            
+            imageReader = ImageReader.newInstance(largest.width, largest.height, format, 2).apply {
+                setOnImageAvailableListener({ reader ->
+                    backgroundHandler?.post {
+                        val image = try { reader.acquireNextImage() } catch (e: Exception) { null } ?: return@post
+                        val timestamp = image.timestamp
+                        val result = captureResults.remove(timestamp)
+                        if (result != null) {
+                            processImage(image, result, characteristics)
+                        } else {
+                            capturedImages[timestamp] = image
+                        }
+                    }
+                }, backgroundHandler)
+            }
+
+            manager.openCamera(cid, object : CameraDevice.StateCallback() {
+                override fun onOpened(camera: CameraDevice) {
+                    cameraOpenCloseLock.release()
+                    cameraDevice = camera
+                    createCaptureSession()
+                }
+                override fun onDisconnected(camera: CameraDevice) {
+                    cameraOpenCloseLock.release()
+                    camera.close()
+                    cameraDevice = null
+                }
+                override fun onError(camera: CameraDevice, error: Int) {
+                    cameraOpenCloseLock.release()
+                    camera.close()
+                    cameraDevice = null
+                }
+            }, backgroundHandler)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to open camera in service", e)
+            cameraOpenCloseLock.release()
         }
     }
 
-    private fun createNotification(): Notification {
-        notificationBuilder = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("AstroCam Background Mode")
-            .setContentText("Ready to capture even when screen is off")
-            .setSmallIcon(R.mipmap.ic_launcher)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-        return notificationBuilder!!.build()
+    private fun processImage(image: Image, result: TotalCaptureResult, characteristics: CameraCharacteristics) {
+        PhotoCaptureHelper.saveImage(this@CameraService, image, 
+            characteristics = characteristics,
+            captureResult = result,
+            onImageSaved = { Log.d(TAG, "Photo saved in background") },
+            onError = { e -> Log.e(TAG, "Error saving photo in background", e) }
+        )
     }
 
-    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
-    private fun startCamera() {
-        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
-        cameraProviderFuture.addListener({
-            if (isDestroyed) return@addListener
-            
-            val cameraProvider: ProcessCameraProvider = try {
-                cameraProviderFuture.get()
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to get camera provider", e)
-                return@addListener
-            }
-
-            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-            
-            // Check if RAW is supported
-            val cameraInfo = cameraProvider.availableCameraInfos.firstOrNull {
-                cameraSelector.filter(listOf(it)).isNotEmpty()
-            }
-            
-            val isRawSupported = cameraInfo?.let {
-                val characteristics = Camera2CameraInfo.from(it).getCameraCharacteristic(
-                    CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES
-                )
-                characteristics?.contains(CameraCharacteristics.REQUEST_AVAILABLE_CAPABILITIES_RAW)
-            } ?: false
-
-            val builder = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                .setTargetAspectRatio(AspectRatio.RATIO_4_3)
-            
-            if (isRawSupported) {
-                builder.setOutputFormat(ImageCapture.OUTPUT_FORMAT_RAW_JPEG)
-                Log.d(TAG, "Enabling RAW+JPEG capture")
-            } else {
-                Log.d(TAG, "RAW not supported on this device, falling back to JPEG")
-            }
-
-            imageCapture = builder.build()
-
-            try {
-                // Unbind any previous use cases before binding new ones
-                cameraProvider.unbindAll()
-                val camera = cameraProvider.bindToLifecycle(
-                    this, cameraSelector, imageCapture
-                )
-                cameraControl = Camera2CameraControl.from(camera.cameraControl)
-                applyManualSettingsIfReady()
-                Log.d(TAG, "Camera bound to service lifecycle")
-            } catch (exc: Exception) {
-                Log.e(TAG, "Use case binding failed", exc)
-            }
-        }, ContextCompat.getMainExecutor(this))
+    private fun createCaptureSession() {
+        val device = cameraDevice ?: return
+        val reader = imageReader ?: return
+        try {
+            device.createCaptureSession(listOf(reader.surface), object : CameraCaptureSession.StateCallback() {
+                override fun onConfigured(session: CameraCaptureSession) {
+                    captureSession = session
+                }
+                override fun onConfigureFailed(session: CameraCaptureSession) {
+                    Log.e(TAG, "Failed to configure capture session")
+                }
+            }, backgroundHandler)
+        } catch (e: CameraAccessException) {
+            Log.e(TAG, "Failed to create capture session", e)
+        }
     }
 
-    @androidx.annotation.OptIn(ExperimentalCamera2Interop::class)
-    private fun applyManualSettingsIfReady(forceShutter: Boolean = false) {
-        val control = cameraControl ?: return
-        if (manualMode) {
-            val builder = CaptureRequestOptions.Builder()
-                .setCaptureRequestOption(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.SENSOR_SENSITIVITY, iso)
-                .setCaptureRequestOption(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_OFF)
-                .setCaptureRequestOption(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistance)
-            
-            if (forceShutter) {
-                builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, shutterSpeed)
-                builder.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, shutterSpeed)
-            } else {
-                val safeShutter = CameraUtils.getPreviewExposureTime(shutterSpeed)
-                builder.setCaptureRequestOption(CaptureRequest.SENSOR_EXPOSURE_TIME, safeShutter)
-                builder.setCaptureRequestOption(CaptureRequest.SENSOR_FRAME_DURATION, CameraUtils.getPreviewFrameDuration(safeShutter))
-            }
-            control.captureRequestOptions = builder.build()
-        } else {
-            control.captureRequestOptions = CaptureRequestOptions.Builder().build()
+    private fun closeCamera() {
+        try {
+            cameraOpenCloseLock.acquire()
+            captureSession?.close()
+            captureSession = null
+            cameraDevice?.close()
+            cameraDevice = null
+            imageReader?.close()
+            imageReader = null
+            captureResults.clear()
+            capturedImages.values.forEach { it.close() }
+            capturedImages.clear()
+        } catch (e: InterruptedException) {
+            Log.e(TAG, "Interrupted while closing camera", e)
+        } finally {
+            cameraOpenCloseLock.release()
         }
     }
 
@@ -213,12 +238,7 @@ class CameraService : LifecycleService() {
         mediaSession = MediaSessionCompat(this, TAG).apply {
             setCallback(object : MediaSessionCompat.Callback() {
                 override fun onMediaButtonEvent(mediaButtonEvent: Intent?): Boolean {
-                    val keyEvent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        mediaButtonEvent?.getParcelableExtra(Intent.EXTRA_KEY_EVENT, KeyEvent::class.java)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        mediaButtonEvent?.getParcelableExtra(Intent.EXTRA_KEY_EVENT)
-                    }
+                    val keyEvent = mediaButtonEvent?.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
                     if (keyEvent?.action == KeyEvent.ACTION_DOWN) {
                         takePhoto()
                         return true
@@ -237,94 +257,56 @@ class CameraService : LifecycleService() {
     }
 
     private fun takePhoto() {
-        wakeLock?.acquire(10 * 60 * 1000L /*10 minutes max*/)
+        wakeLock?.acquire(10 * 60 * 1000L)
         Log.d(TAG, "Taking photo in background.")
+        
         notificationBuilder?.setContentText("Capturing image...")
         notificationManager?.notify(NOTIFICATION_ID, notificationBuilder?.build())
+        
         capturePhoto()
     }
 
     private fun capturePhoto() {
-        val imageCapture = imageCapture ?: run {
+        val device = cameraDevice ?: run {
             resetNotification("Camera not ready.")
-            wakeLock?.release()
+            if (wakeLock?.isHeld == true) wakeLock?.release()
             return
         }
-
-        val name = SimpleDateFormat(FILENAME_FORMAT, Locale.US).format(System.currentTimeMillis())
-        
-        // Use File-based output for RAW_JPEG as it's more reliable for multiple files
-        val outputDirectory = getExternalFilesDir(null) ?: filesDir
-        val photoFile = File(outputDirectory, "$name.jpg")
-
-        val outputOptions = ImageCapture.OutputFileOptions.Builder(photoFile).build()
-
-        applyManualSettingsIfReady(true)
-        
-        // Play shutter sound
-        shutterSound.play(MediaActionSound.SHUTTER_CLICK)
-
-        imageCapture.takePicture(
-            outputOptions,
-            ContextCompat.getMainExecutor(this),
-            object : ImageCapture.OnImageSavedCallback {
-                override fun onError(exc: ImageCaptureException) {
-                    Log.e(TAG, "Photo capture failed: ${exc.message}", exc)
-                    resetNotification("Capture failed: ${exc.message}")
-                    applyManualSettingsIfReady(false)
-                    if (wakeLock?.isHeld == true) wakeLock?.release()
-                }
-
-                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
-                    Log.d(TAG, "Photo capture succeeded. JPEG: ${photoFile.absolutePath}")
-                    
-                    val rawFile = File(photoFile.absolutePath.replace(".jpg", ".dng"))
-                    if (rawFile.exists()) {
-                        Log.d(TAG, "RAW file saved: ${rawFile.absolutePath}")
-                        resetNotification("Photo saved (RAW+JPEG).")
-                        addToMediaStore(rawFile, "image/x-adobe-dng")
-                    } else {
-                        Log.w(TAG, "RAW file NOT found")
-                        resetNotification("Photo saved (JPEG).")
-                    }
-                    
-                    addToMediaStore(photoFile, "image/jpeg")
-
-                    applyManualSettingsIfReady(false)
-                    if (wakeLock?.isHeld == true) wakeLock?.release()
-                }
-            }
-        )
-    }
-
-    private fun addToMediaStore(file: File, mimeType: String) {
-        val values = ContentValues().apply {
-            put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
-            put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/AstroCam")
-                put(MediaStore.MediaColumns.IS_PENDING, 1)
-            }
+        val session = captureSession ?: run {
+            resetNotification("Session not ready.")
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            return
         }
+        val reader = imageReader ?: return
 
-        val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
-        val uri = contentResolver.insert(collection, values)
-        
-        uri?.let { targetUri ->
-            try {
-                contentResolver.openOutputStream(targetUri)?.use { outputStream ->
-                    file.inputStream().use { inputStream ->
-                        inputStream.copyTo(outputStream)
+        try {
+            val settings = PhotoCaptureHelper.CaptureSettings(manualMode, iso, shutterSpeed, focusDistance)
+            val captureBuilder = PhotoCaptureHelper.createCaptureRequest(device, listOf(reader.surface), settings)
+
+            shutterSound.play(MediaActionSound.SHUTTER_CLICK)
+            session.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+                    val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)!!
+                    val image = capturedImages.remove(timestamp)
+                    if (image != null) {
+                        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+                        val characteristics = manager.getCameraCharacteristics(currentCameraId!!)
+                        processImage(image, result, characteristics)
+                    } else {
+                        captureResults[timestamp] = result
                     }
+                    resetNotification("Photo saved.")
+                    if (wakeLock?.isHeld == true) wakeLock?.release()
                 }
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    values.clear()
-                    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                    contentResolver.update(targetUri, values, null, null)
+                override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
+                    resetNotification("Capture failed.")
+                    if (wakeLock?.isHeld == true) wakeLock?.release()
                 }
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to write to MediaStore", e)
-            }
+            }, backgroundHandler)
+        } catch (e: CameraAccessException) {
+            Log.e(TAG, "Capture failed in background", e)
+            resetNotification("Capture failed: ${e.message}")
+            if (wakeLock?.isHeld == true) wakeLock?.release()
         }
     }
 
@@ -338,17 +320,34 @@ class CameraService : LifecycleService() {
     }
 
     override fun onDestroy() {
-        isDestroyed = true
         super.onDestroy()
+        closeCamera()
+        stopBackgroundThread()
         if (wakeLock?.isHeld == true) wakeLock?.release()
         mediaSession?.release()
         shutterSound.release()
-        
-        // Explicitly unbind everything when service is destroyed
-        try {
-            ProcessCameraProvider.getInstance(this).get().unbindAll()
-        } catch (e: Exception) {
-            Log.e(TAG, "Error unbinding on destroy", e)
+    }
+
+    override fun onBind(intent: Intent?) = null
+
+    private class CompareSizesByArea : Comparator<android.util.Size> {
+        override fun compare(lhs: android.util.Size, rhs: android.util.Size): Int =
+            java.lang.Long.signum(lhs.width.toLong() * lhs.height - rhs.width.toLong() * rhs.height)
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val serviceChannel = NotificationChannel(CHANNEL_ID, "Camera Service Channel", NotificationManager.IMPORTANCE_LOW)
+            notificationManager?.createNotificationChannel(serviceChannel)
         }
+    }
+
+    private fun createNotification(): Notification {
+        notificationBuilder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("AstroCam Background Mode")
+            .setContentText("Ready to capture even when screen is off")
+            .setSmallIcon(R.mipmap.ic_launcher)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+        return notificationBuilder!!.build()
     }
 }
