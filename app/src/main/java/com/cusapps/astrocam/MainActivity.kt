@@ -8,6 +8,7 @@ import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
+import android.hardware.camera2.CameraMetadata
 import android.media.Image
 import android.media.ImageReader
 import android.media.MediaActionSound
@@ -17,6 +18,7 @@ import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import android.util.Size
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
 import android.view.WindowManager
@@ -76,6 +78,7 @@ class MainActivity : AppCompatActivity() {
         setupRetractableControls()
         setupCameraSwitch()
         setupManualControls()
+        setupTapToFocus()
     }
 
     private val surfaceTextureListener = object : TextureView.SurfaceTextureListener {
@@ -479,6 +482,60 @@ class MainActivity : AppCompatActivity() {
             override fun onStartTrackingTouch(seekBar: SeekBar?) {}
             override fun onStopTrackingTouch(seekBar: SeekBar?) {}
         })
+    }
+
+    @SuppressLint("ClickableViewAccessibility")
+    private fun setupTapToFocus() {
+        viewBinding.viewFinder.setOnTouchListener { _, event ->
+            if (event.action == MotionEvent.ACTION_DOWN) {
+                focusOnTouch(event)
+                true
+            } else {
+                false
+            }
+        }
+    }
+
+    private fun focusOnTouch(event: MotionEvent) {
+        val device = cameraDevice ?: return
+        val session = captureSession ?: return
+        val builder = previewRequestBuilder ?: return
+        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+        
+        if (cameraId == null) return
+        val characteristics = manager.getCameraCharacteristics(cameraId!!)
+        
+        val focusArea = TapToFocusHelper.getFocusArea(
+            event, 
+            viewBinding.viewFinder.width, 
+            viewBinding.viewFinder.height, 
+            characteristics
+        ) ?: return
+
+        try {
+            // Cancel any existing AF trigger
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_CANCEL)
+            session.capture(builder.build(), null, backgroundHandler)
+
+            // Add new focus area and start focus
+            if (characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AF) ?: 0 > 0) {
+                builder.set(CaptureRequest.CONTROL_AF_REGIONS, arrayOf(focusArea))
+            }
+            if (characteristics.get(CameraCharacteristics.CONTROL_MAX_REGIONS_AE) ?: 0 > 0) {
+                builder.set(CaptureRequest.CONTROL_AE_REGIONS, arrayOf(focusArea))
+            }
+            
+            builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_START)
+
+            session.capture(builder.build(), null, backgroundHandler)
+
+            builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
+            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+
+        } catch (e: CameraAccessException) {
+            Log.e(TAG, "Failed to set focus area", e)
+        }
     }
 
     private fun initializeMediaSession() {
