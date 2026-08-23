@@ -42,8 +42,10 @@
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
         android:orientation="vertical"
-        android:padding="16dp"
-        android:background="#80000000"
+        android:layout_margin="12dp"
+        android:background="@drawable/bg_control_card"
+        android:elevation="8dp"
+        android:padding="18dp"
         android:visibility="gone"
         app:layout_constraintTop_toTopOf="parent">
 
@@ -59,7 +61,10 @@
                 android:layout_height="wrap_content"
                 android:text="RAW"
                 android:textColor="@android:color/white"
-                android:padding="8dp" />
+                android:textSize="13sp"
+                android:padding="8dp"
+                app:thumbTint="@color/switch_thumb_color"
+                app:trackTint="@color/switch_track_color" />
 
             <View
                 android:layout_width="0dp"
@@ -73,26 +78,31 @@
                 android:layout_height="wrap_content"
                 android:text="Manual"
                 android:textColor="@android:color/white"
-                android:padding="8dp" />
+                android:textSize="13sp"
+                android:padding="8dp"
+                app:thumbTint="@color/switch_thumb_color"
+                app:trackTint="@color/switch_track_color" />
         </LinearLayout>
 
         <LinearLayout
             android:layout_width="match_parent"
             android:layout_height="wrap_content"
             android:orientation="horizontal"
-            android:layout_marginTop="8dp">
+            android:layout_marginTop="14dp">
             <TextView
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Timer: "
-                android:textColor="@android:color/white" />
+                android:textColor="#B8C0CC"
+                android:textSize="13sp" />
             <TextView
                 android:id="@+id/timerValueText"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="0s"
                 android:textColor="@android:color/white"
-                android:textStyle="bold" />
+                android:textStyle="bold"
+                android:textSize="13sp" />
         </LinearLayout>
 
         <SeekBar
@@ -110,14 +120,16 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Burst Count: "
-                android:textColor="@android:color/white" />
+                android:textColor="#B8C0CC"
+                android:textSize="13sp" />
             <TextView
                 android:id="@+id/burstValueText"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="1"
                 android:textColor="@android:color/white"
-                android:textStyle="bold" />
+                android:textStyle="bold"
+                android:textSize="13sp" />
         </LinearLayout>
 
         <SeekBar
@@ -135,14 +147,16 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Shutter Speed: "
-                android:textColor="@android:color/white" />
+                android:textColor="#B8C0CC"
+                android:textSize="13sp" />
             <TextView
                 android:id="@+id/shutterSpeedValueText"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Auto"
                 android:textColor="@android:color/white"
-                android:textStyle="bold" />
+                android:textStyle="bold"
+                android:textSize="13sp" />
         </LinearLayout>
 
         <SeekBar
@@ -159,14 +173,16 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="ISO: "
-                android:textColor="@android:color/white" />
+                android:textColor="#B8C0CC"
+                android:textSize="13sp" />
             <TextView
                 android:id="@+id/isoValueText"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Auto"
                 android:textColor="@android:color/white"
-                android:textStyle="bold" />
+                android:textStyle="bold"
+                android:textSize="13sp" />
         </LinearLayout>
 
         <SeekBar
@@ -183,14 +199,16 @@
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Focus Distance: "
-                android:textColor="@android:color/white" />
+                android:textColor="#B8C0CC"
+                android:textSize="13sp" />
             <TextView
                 android:id="@+id/focusDistanceValueText"
                 android:layout_width="wrap_content"
                 android:layout_height="wrap_content"
                 android:text="Auto"
                 android:textColor="@android:color/white"
-                android:textStyle="bold" />
+                android:textStyle="bold"
+                android:textSize="13sp" />
         </LinearLayout>
 
         <SeekBar
@@ -199,31 +217,40 @@
             android:layout_height="wrap_content" />
     </LinearLayout>
 
-    <Button
+    <ImageButton
         android:id="@+id/toggleControlsButton"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
         android:layout_margin="16dp"
-        android:text="Controls"
+        android:background="@drawable/bg_icon_button"
+        android:contentDescription="Open camera controls"
+        android:padding="12dp"
+        android:src="@drawable/ic_settings"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintTop_toBottomOf="@id/controls" />
 
-    <Button
+    <ImageButton
         android:id="@+id/switchCameraButton"
-        android:layout_width="wrap_content"
-        android:layout_height="wrap_content"
+        android:layout_width="48dp"
+        android:layout_height="48dp"
         android:layout_margin="16dp"
-        android:text="Switch"
+        android:background="@drawable/bg_icon_button"
+        android:contentDescription="Switch camera"
+        android:padding="12dp"
+        android:src="@drawable/ic_camera_switch"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintTop_toBottomOf="@id/controls" />
 
-    <Button
+    <ImageButton
         android:id="@+id/imageCaptureButton"
         android:layout_width="110dp"
         android:layout_height="110dp"
         android:layout_marginBottom="50dp"
-        android:text="Take Photo"
-        android:elevation="2dp"
+        android:background="@drawable/bg_capture_button"
+        android:contentDescription="Take photo"
+        android:elevation="6dp"
+        android:padding="28dp"
+        android:src="@drawable/ic_shutter"
         app:layout_constraintBottom_toBottomOf="parent"
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
