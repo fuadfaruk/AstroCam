@@ -6,6 +6,7 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.util.Size
 import java.util.Locale
+import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
@@ -13,6 +14,12 @@ import kotlin.math.sqrt
  * This object centralizes manual exposure, ISO, and focus calculations.
  */
 object CameraUtils {
+    data class PreviewTransform(
+        val scale: Float,
+        val offsetX: Float,
+        val offsetY: Float
+    )
+
     const val PREVIEW_MAX_EXPOSURE_NS = 66_666_666L 
     const val PREVIEW_MIN_FRAME_DURATION_NS = 33_333_333L 
 
@@ -134,5 +141,21 @@ object CameraUtils {
             notBigEnough.size > 0 -> notBigEnough.maxByOrNull { it.width * it.height }!!
             else -> choices[0]
         }
+    }
+
+    fun calculatePreviewTransform(viewWidth: Int, viewHeight: Int, previewWidth: Int, previewHeight: Int): PreviewTransform {
+        if (viewWidth <= 0 || viewHeight <= 0 || previewWidth <= 0 || previewHeight <= 0) {
+            return PreviewTransform(1f, 0f, 0f)
+        }
+
+        val scale = min(viewWidth.toFloat() / previewWidth, viewHeight.toFloat() / previewHeight)
+        val scaledWidth = previewWidth * scale
+        val scaledHeight = previewHeight * scale
+
+        return PreviewTransform(
+            scale = scale,
+            offsetX = (viewWidth - scaledWidth) / 2f,
+            offsetY = (viewHeight - scaledHeight) / 2f
+        )
     }
 }

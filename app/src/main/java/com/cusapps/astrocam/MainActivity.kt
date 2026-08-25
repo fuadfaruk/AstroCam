@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
+import android.graphics.Matrix
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.CameraMetadata
@@ -85,7 +86,9 @@ class MainActivity : AppCompatActivity() {
         override fun onSurfaceTextureAvailable(texture: SurfaceTexture, width: Int, height: Int) {
             openCamera(width, height)
         }
-        override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {}
+        override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
+            updatePreviewTransform(width, height)
+        }
         override fun onSurfaceTextureDestroyed(texture: SurfaceTexture) = true
         override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {}
     }
@@ -210,13 +213,43 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
+    private fun applyPreviewTransformForCurrentSize(previewSize: Size) {
+        val transform = CameraUtils.calculatePreviewTransform(
+            viewBinding.viewFinder.width,
+            viewBinding.viewFinder.height,
+            previewSize.width,
+            previewSize.height
+        )
+        val matrix = Matrix().apply {
+            setScale(transform.scale, transform.scale)
+            postTranslate(transform.offsetX, transform.offsetY)
+        }
+        viewBinding.viewFinder.setTransform(matrix)
+    }
+
+    private fun updatePreviewTransform(width: Int, height: Int) {
+        val device = cameraDevice ?: return
+        val characteristics = (getSystemService(Context.CAMERA_SERVICE) as CameraManager).getCameraCharacteristics(cameraId ?: return)
+        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
+        val previewSize = CameraUtils.chooseOptimalSize(
+            map.getOutputSizes(SurfaceTexture::class.java),
+            width,
+            height,
+            width,
+            height,
+            Size(4, 3)
+        )
+        applyPreviewTransformForCurrentSize(previewSize)
+    }
+
     private fun createCameraPreviewSession() {
         try {
             val texture = viewBinding.viewFinder.surfaceTexture!!
             val characteristics = (getSystemService(Context.CAMERA_SERVICE) as CameraManager).getCameraCharacteristics(cameraId!!)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
             val previewSize = CameraUtils.chooseOptimalSize(map.getOutputSizes(SurfaceTexture::class.java), viewBinding.viewFinder.width, viewBinding.viewFinder.height, viewBinding.viewFinder.width, viewBinding.viewFinder.height, Size(4, 3))
-            
+            applyPreviewTransformForCurrentSize(previewSize)
+
             texture.setDefaultBufferSize(previewSize.width, previewSize.height)
             val surface = Surface(texture)
 

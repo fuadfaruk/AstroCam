@@ -85,4 +85,13 @@ class CameraUtilsTest {
         val longishExposure = 40_000_000L // 1/25s
         assertEquals(longishExposure, CameraUtils.getPreviewFrameDuration(longishExposure))
     }
+
+    @Test
+    fun `calculatePreviewTransform keeps preview aspect ratio within the screen`() {
+        val transform = CameraUtils.calculatePreviewTransform(1080, 1920, 1440, 1080)
+
+        assertEquals(0.75f, transform.scale, 0.001f)
+        assertEquals(0f, transform.offsetX, 0.001f)
+        assertEquals(555f, transform.offsetY, 0.001f)
+    }
 }
