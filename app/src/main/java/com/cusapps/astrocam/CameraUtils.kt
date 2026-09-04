@@ -6,7 +6,6 @@ import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
 import android.util.Size
 import java.util.Locale
-import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
@@ -143,19 +142,27 @@ object CameraUtils {
         }
     }
 
+    /**
+     * Calculates a transform that scales the preview buffer to fill the view width
+     * and aligns it to the TOP of the view. Any leftover vertical space collects
+     * below the preview (the bottom black area), so nothing is ever centered into
+     * a top black bar.
+     */
     fun calculatePreviewTransform(viewWidth: Int, viewHeight: Int, previewWidth: Int, previewHeight: Int): PreviewTransform {
         if (viewWidth <= 0 || viewHeight <= 0 || previewWidth <= 0 || previewHeight <= 0) {
             return PreviewTransform(1f, 0f, 0f)
         }
 
-        val scale = min(viewWidth.toFloat() / previewWidth, viewHeight.toFloat() / previewHeight)
+        // Scale so the preview spans the full view width; height follows the
+        // preview aspect ratio. Top-aligned: offsetY is always 0.
+        val scale = viewWidth.toFloat() / previewWidth
         val scaledWidth = previewWidth * scale
         val scaledHeight = previewHeight * scale
 
         return PreviewTransform(
             scale = scale,
             offsetX = (viewWidth - scaledWidth) / 2f,
-            offsetY = (viewHeight - scaledHeight) / 2f
+            offsetY = 0f
         )
     }
 }

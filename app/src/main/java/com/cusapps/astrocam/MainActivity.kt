@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
 import android.graphics.Matrix
+import android.graphics.Point
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.CameraMetadata
@@ -50,6 +51,11 @@ class MainActivity : AppCompatActivity() {
 
     private var cameraIndex = 0
     private var cameraIds = listOf<String>()
+    private var previewSize: Size? = null
+    private var displayRotation = Surface.ROTATION_0
+    private val displaySize = Point()
+    private var viewFinderWidth = 0
+    private var viewFinderHeight = 0
     
     private var mediaSession: MediaSessionCompat? = null
     private val shutterSound = MediaActionSound()
@@ -157,6 +163,13 @@ class MainActivity : AppCompatActivity() {
             return
         }
 
+        // Capture display metrics on the UI thread; createCameraPreviewSession()
+        // later runs on the background handler and must not touch views.
+        displayRotation = windowManager.defaultDisplay.rotation
+        windowManager.defaultDisplay.getSize(displaySize)
+        viewFinderWidth = viewBinding.viewFinder.width
+        viewFinderHeight = viewBinding.viewFinder.height
+
         val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         try {
             if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
@@ -214,43 +227,86 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun applyPreviewTransformForCurrentSize(previewSize: Size) {
-        val transform = CameraUtils.calculatePreviewTransform(
-            viewBinding.viewFinder.width,
-            viewBinding.viewFinder.height,
-            previewSize.width,
-            previewSize.height
-        )
-        val matrix = Matrix().apply {
-            setScale(transform.scale, transform.scale)
-            postTranslate(transform.offsetX, transform.offsetY)
+        // No transform matrix: the SurfaceTexture already displays the buffer
+        // upright in portrait. The view itself is sized to the preview aspect
+        // ratio via setViewFinderRatio(), so the buffer fills it exactly.
+        runOnUiThread { viewBinding.viewFinder.setTransform(Matrix()) }
+    }
+
+    private fun setViewFinderRatio(width: Int, height: Int) {
+        if (width <= 0 || height <= 0) return
+        runOnUiThread {
+            val params = viewBinding.viewFinder.layoutParams as
+                    androidx.constraintlayout.widget.ConstraintLayout.LayoutParams
+            params.dimensionRatio = "$width:$height"
+            viewBinding.viewFinder.layoutParams = params
+            viewBinding.viewFinder.requestLayout()
         }
-        viewBinding.viewFinder.setTransform(matrix)
     }
 
     private fun updatePreviewTransform(width: Int, height: Int) {
-        val device = cameraDevice ?: return
-        val characteristics = (getSystemService(Context.CAMERA_SERVICE) as CameraManager).getCameraCharacteristics(cameraId ?: return)
-        val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP) ?: return
-        val previewSize = CameraUtils.chooseOptimalSize(
-            map.getOutputSizes(SurfaceTexture::class.java),
-            width,
-            height,
-            width,
-            height,
-            Size(4, 3)
-        )
-        applyPreviewTransformForCurrentSize(previewSize)
+        // Kept for the SurfaceTexture size listener; the view ratio is set in
+        // createCameraPreviewSession() once the preview size is known.
     }
 
     private fun createCameraPreviewSession() {
         try {
             val texture = viewBinding.viewFinder.surfaceTexture!!
-            val characteristics = (getSystemService(Context.CAMERA_SERVICE) as CameraManager).getCameraCharacteristics(cameraId!!)
+            val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val characteristics = manager.getCameraCharacteristics(cameraId!!)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
-            val previewSize = CameraUtils.chooseOptimalSize(map.getOutputSizes(SurfaceTexture::class.java), viewBinding.viewFinder.width, viewBinding.viewFinder.height, viewBinding.viewFinder.width, viewBinding.viewFinder.height, Size(4, 3))
-            applyPreviewTransformForCurrentSize(previewSize)
 
-            texture.setDefaultBufferSize(previewSize.width, previewSize.height)
+            // Choose the preview size relative to the sensor coordinate system,
+            // mirroring the official Camera2 sample: swap the view dimensions when
+            // the display (portrait) and sensor orientation disagree.
+            val sensorOrientation = characteristics.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            val swappedDimensions = when (displayRotation) {
+                Surface.ROTATION_0, Surface.ROTATION_180 ->
+                    sensorOrientation == 90 || sensorOrientation == 270
+                Surface.ROTATION_90, Surface.ROTATION_270 ->
+                    sensorOrientation == 0 || sensorOrientation == 180
+                else -> false
+            }
+
+            var rotatedPreviewWidth = viewBinding.viewFinder.width
+            var rotatedPreviewHeight = viewBinding.viewFinder.height
+            var maxPreviewWidth = displaySize.x
+            var maxPreviewHeight = displaySize.y
+            if (swappedDimensions) {
+                rotatedPreviewWidth = viewFinderHeight
+                rotatedPreviewHeight = viewFinderWidth
+                maxPreviewWidth = displaySize.y
+                maxPreviewHeight = displaySize.x
+            }
+            maxPreviewWidth = minOf(maxPreviewWidth, MAX_PREVIEW_WIDTH)
+            maxPreviewHeight = minOf(maxPreviewHeight, MAX_PREVIEW_HEIGHT)
+
+            val chosenPreviewSize = CameraUtils.chooseOptimalSize(
+                map.getOutputSizes(SurfaceTexture::class.java),
+                rotatedPreviewWidth,
+                rotatedPreviewHeight,
+                maxPreviewWidth,
+                maxPreviewHeight,
+                Size(4, 3)
+            )
+            previewSize = chosenPreviewSize
+
+            // Size the view itself to the preview's display aspect ratio so the
+            // buffer fills it exactly; leftover screen space stays black below.
+            val displayRatioWidth: Int
+            val displayRatioHeight: Int
+            if (swappedDimensions) {
+                displayRatioWidth = chosenPreviewSize.height
+                displayRatioHeight = chosenPreviewSize.width
+            } else {
+                displayRatioWidth = chosenPreviewSize.width
+                displayRatioHeight = chosenPreviewSize.height
+            }
+            setViewFinderRatio(displayRatioWidth, displayRatioHeight)
+
+            applyPreviewTransformForCurrentSize(chosenPreviewSize)
+
+            texture.setDefaultBufferSize(chosenPreviewSize.width, chosenPreviewSize.height)
             val surface = Surface(texture)
 
             previewRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
@@ -616,6 +672,8 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val TAG = "AstroCamMain"
         private const val REQUEST_CODE_PERMISSIONS = 10
+        private const val MAX_PREVIEW_WIDTH = 1920
+        private const val MAX_PREVIEW_HEIGHT = 1080
         private val REQUIRED_PERMISSIONS = mutableListOf(Manifest.permission.CAMERA).apply {
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) add(Manifest.permission.POST_NOTIFICATIONS)

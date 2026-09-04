@@ -87,11 +87,13 @@ class CameraUtilsTest {
     }
 
     @Test
-    fun `calculatePreviewTransform keeps preview aspect ratio within the screen`() {
+    fun `calculatePreviewTransform fills width and aligns preview to top of view`() {
         val transform = CameraUtils.calculatePreviewTransform(1080, 1920, 1440, 1080)
 
+        // Scale so the 1440-wide buffer spans the full 1080-wide view.
         assertEquals(0.75f, transform.scale, 0.001f)
         assertEquals(0f, transform.offsetX, 0.001f)
-        assertEquals(555f, transform.offsetY, 0.001f)
+        // Top-aligned: no black bar above the preview, leftover stays at the bottom.
+        assertEquals(0f, transform.offsetY, 0.001f)
     }
 }
