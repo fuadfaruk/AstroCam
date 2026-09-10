@@ -28,7 +28,8 @@ object PhotoCaptureHelper {
         val isManualMode: Boolean,
         val iso: Int,
         val shutterSpeed: Long,
-        val focusDistance: Float
+        val focusDistance: Float,
+        val whiteBalance: CameraUtils.WhiteBalance = CameraUtils.WhiteBalance()
     )
 
     /**
@@ -96,7 +97,14 @@ object PhotoCaptureHelper {
         } else {
             CameraUtils.applyAutoSettings(builder)
         }
-        
+
+        // Only override the still template's white balance when the lock is engaged.
+        // The unlocked path should keep the device defaults, and re-applying here would
+        // force COLOR_CORRECTION_MODE_FAST onto captures that never asked for it.
+        if (settings.whiteBalance.locked) {
+            CameraUtils.applyWhiteBalance(builder, settings.whiteBalance)
+        }
+
         // High quality settings
         builder.set(CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE, CaptureRequest.COLOR_CORRECTION_ABERRATION_MODE_HIGH_QUALITY)
         builder.set(CaptureRequest.EDGE_MODE, CaptureRequest.EDGE_MODE_HIGH_QUALITY)

@@ -2,4 +2,5 @@
     <string name="app_name">Astro Cam</string>
     <string name="timer_seconds">%1$ds</string>
     <string name="auto">Auto</string>
+    <string name="locked">Locked</string>
 </resources>

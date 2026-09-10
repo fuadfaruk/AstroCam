@@ -2,6 +2,7 @@ package com.cusapps.astrocam
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class CameraUtilsTest {
@@ -95,5 +96,112 @@ class CameraUtilsTest {
         assertEquals(0f, transform.offsetX, 0.001f)
         // Top-aligned: no black bar above the preview, leftover stays at the bottom.
         assertEquals(0f, transform.offsetY, 0.001f)
+    }
+
+    @Test
+    fun `calculateColorTemperature maps minimum progress to minimum temperature`() {
+        assertEquals(CameraUtils.WB_MIN_TEMPERATURE_K, CameraUtils.calculateColorTemperature(0))
+    }
+
+    @Test
+    fun `calculateColorTemperature maps maximum progress to maximum temperature`() {
+        assertEquals(CameraUtils.WB_MAX_TEMPERATURE_K, CameraUtils.calculateColorTemperature(CameraUtils.WB_TEMPERATURE_PROGRESS_MAX))
+    }
+
+    @Test
+    fun `calculateColorTemperature clamps out of range progress`() {
+        assertEquals(CameraUtils.WB_MIN_TEMPERATURE_K, CameraUtils.calculateColorTemperature(-5))
+        assertEquals(CameraUtils.WB_MAX_TEMPERATURE_K, CameraUtils.calculateColorTemperature(9999))
+    }
+
+    @Test
+    fun `calculateTemperatureProgress is the inverse of calculateColorTemperature`() {
+        for (temperatureK in 2000..10000 step 100) {
+            val progress = CameraUtils.calculateTemperatureProgress(temperatureK)
+            assertEquals(temperatureK, CameraUtils.calculateColorTemperature(progress))
+        }
+    }
+
+    @Test
+    fun `calculateTemperatureProgress clamps out of range temperatures`() {
+        assertEquals(0, CameraUtils.calculateTemperatureProgress(500))
+        assertEquals(CameraUtils.WB_TEMPERATURE_PROGRESS_MAX, CameraUtils.calculateTemperatureProgress(50000))
+    }
+
+    @Test
+    fun `calculateWhiteBalanceGains are unity at the neutral temperature`() {
+        val gains = CameraUtils.calculateWhiteBalanceGains(CameraUtils.WB_NEUTRAL_TEMPERATURE_K)
+
+        assertEquals(1.0f, gains.red, 0.001f)
+        assertEquals(1.0f, gains.green, 0.001f)
+        assertEquals(1.0f, gains.blue, 0.001f)
+    }
+
+    @Test
+    fun `calculateWhiteBalanceGains at low temperature favor blue`() {
+        // A low Kelvin target renders the image cooler, so the blue channel is
+        // boosted relative to red.
+        val coolGains = CameraUtils.calculateWhiteBalanceGains(CameraUtils.WB_MIN_TEMPERATURE_K)
+
+        // Every channel must satisfy Camera2's >= 1.0 requirement.
+        assertTrue(coolGains.red >= 1.0f)
+        assertTrue(coolGains.green >= 1.0f)
+        assertTrue(coolGains.blue >= 1.0f)
+        // One channel is normalised to exactly 1.0.
+        assertEquals(1.0f, minOf(coolGains.red, coolGains.green, coolGains.blue), 0.001f)
+        assertTrue(coolGains.blue > coolGains.red)
+    }
+
+    @Test
+    fun `calculateWhiteBalanceGains at high temperature favor red`() {
+        // A high Kelvin target renders the image warmer, so the red channel is
+        // boosted relative to blue.
+        val warmGains = CameraUtils.calculateWhiteBalanceGains(CameraUtils.WB_MAX_TEMPERATURE_K)
+
+        assertTrue(warmGains.red > warmGains.blue)
+        assertEquals(1.0f, minOf(warmGains.red, warmGains.green, warmGains.blue), 0.001f)
+    }
+
+    @Test
+    fun `calculateWhiteBalanceGains never exceeds the channel cap`() {
+        for (temperatureK in 2000..10000 step 500) {
+            val gains = CameraUtils.calculateWhiteBalanceGains(temperatureK)
+            assertTrue(gains.red <= CameraUtils.WB_MAX_CHANNEL_GAIN)
+            assertTrue(gains.green <= CameraUtils.WB_MAX_CHANNEL_GAIN)
+            assertTrue(gains.blue <= CameraUtils.WB_MAX_CHANNEL_GAIN)
+        }
+    }
+
+    @Test
+    fun `estimateColorTemperature recovers the temperature behind measured gains`() {
+        for (temperatureK in intArrayOf(3000, 5000, 6500, 8000)) {
+            val gains = CameraUtils.calculateWhiteBalanceGains(temperatureK)
+            assertEquals(temperatureK, CameraUtils.estimateColorTemperature(gains))
+        }
+    }
+
+    @Test
+    fun `estimateColorTemperature ignores overall gain scaling`() {
+        val gains = CameraUtils.calculateWhiteBalanceGains(4000)
+        val brighter = CameraUtils.WhiteBalanceGains(
+            red = gains.red * 3.0f,
+            green = gains.green * 3.0f,
+            blue = gains.blue * 3.0f
+        )
+
+        // Only channel ratios matter, so a uniformly brighter frame maps to the same
+        // temperature instead of drifting with exposure.
+        assertEquals(4000, CameraUtils.estimateColorTemperature(brighter))
+    }
+
+    @Test
+    fun `estimateColorTemperature falls back to default for invalid gains`() {
+        val invalid = CameraUtils.WhiteBalanceGains(0f, 0f, 0f)
+        assertEquals(CameraUtils.WB_DEFAULT_TEMPERATURE_K, CameraUtils.estimateColorTemperature(invalid))
+    }
+
+    @Test
+    fun `formatColorTemperature appends the Kelvin unit`() {
+        assertEquals("4000K", CameraUtils.formatColorTemperature(4000))
     }
 }

@@ -44,6 +44,7 @@ class CameraService : Service() {
     private var iso = 400
     private var shutterSpeed = 1_000_000_000L
     private var focusDistance = 0f
+    private var whiteBalance = CameraUtils.WhiteBalance()
     
     private var currentCameraId: String? = null
     
@@ -69,6 +70,9 @@ class CameraService : Service() {
         const val EXTRA_ISO = "extra_iso"
         const val EXTRA_SHUTTER = "extra_shutter"
         const val EXTRA_FOCUS = "extra_focus"
+        const val EXTRA_WB_LOCKED = "extra_wb_locked"
+        const val EXTRA_WB_TEMPERATURE = "extra_wb_temperature"
+        const val EXTRA_WB_MANUAL_SUPPORTED = "extra_wb_manual_supported"
         const val EXTRA_CAMERA_ID = "extra_camera_id"
     }
 
@@ -118,6 +122,15 @@ class CameraService : Service() {
             iso = intent.getIntExtra(EXTRA_ISO, 400)
             shutterSpeed = intent.getLongExtra(EXTRA_SHUTTER, 1_000_000_000L)
             focusDistance = intent.getFloatExtra(EXTRA_FOCUS, 0f)
+
+            // The service has no preview, so its AWB never converges on its own. The
+            // locked gains must come across from the activity to keep background
+            // frames colour-matched to the rest of the sequence.
+            whiteBalance = CameraUtils.WhiteBalance(
+                locked = intent.getBooleanExtra(EXTRA_WB_LOCKED, false),
+                temperatureK = intent.getIntExtra(EXTRA_WB_TEMPERATURE, CameraUtils.WB_DEFAULT_TEMPERATURE_K),
+                manualGainsSupported = intent.getBooleanExtra(EXTRA_WB_MANUAL_SUPPORTED, false)
+            )
             
             val newCameraId = intent.getStringExtra(EXTRA_CAMERA_ID)
             
@@ -127,7 +140,7 @@ class CameraService : Service() {
                 openCamera()
             }
 
-            Log.d(TAG, "Settings updated: Manual=$manualMode, RAW=$rawMode, ISO=$iso, Shutter=$shutterSpeed")
+            Log.d(TAG, "Settings updated: Manual=$manualMode, RAW=$rawMode, ISO=$iso, Shutter=$shutterSpeed, WBLocked=${whiteBalance.locked}, WBTemp=${whiteBalance.temperatureK}")
         }
         MediaButtonReceiver.handleIntent(mediaSession, intent)
         return START_NOT_STICKY
@@ -280,7 +293,7 @@ class CameraService : Service() {
         val reader = imageReader ?: return
 
         try {
-            val settings = PhotoCaptureHelper.CaptureSettings(manualMode, iso, shutterSpeed, focusDistance)
+            val settings = PhotoCaptureHelper.CaptureSettings(manualMode, iso, shutterSpeed, focusDistance, whiteBalance)
             val captureBuilder = PhotoCaptureHelper.createCaptureRequest(device, listOf(reader.surface), settings)
 
             shutterSound.play(MediaActionSound.SHUTTER_CLICK)

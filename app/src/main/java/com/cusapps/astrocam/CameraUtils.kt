@@ -4,13 +4,16 @@ import android.content.Context
 import android.hardware.camera2.CameraCharacteristics
 import android.hardware.camera2.CameraManager
 import android.hardware.camera2.CaptureRequest
+import android.hardware.camera2.params.RggbChannelVector
 import android.util.Size
 import java.util.Locale
+import kotlin.math.ln
+import kotlin.math.pow
 import kotlin.math.sqrt
 
 /**
  * CameraUtils provides utility functions for low-level camera control using Camera2.
- * This object centralizes manual exposure, ISO, and focus calculations.
+ * This object centralizes manual exposure, ISO, focus, and white balance calculations.
  */
 object CameraUtils {
     data class PreviewTransform(
@@ -19,8 +22,51 @@ object CameraUtils {
         val offsetY: Float
     )
 
+    /**
+     * Per-channel raw white balance gains. Kept as plain floats (rather than an
+     * RggbChannelVector) so the conversion math stays unit-testable on the JVM.
+     */
+    data class WhiteBalanceGains(
+        val red: Float,
+        val green: Float,
+        val blue: Float
+    )
+
+    /**
+     * User-facing white balance state. When [locked] is false the camera's own AWB
+     * algorithm runs freely (the default). When [locked] is true the white balance
+     * stops drifting between frames, which is what keeps colour consistent across a
+     * long-exposure or nighttime burst.
+     *
+     * [manualGainsSupported] reflects whether the device can accept explicit colour
+     * gains (CONTROL_AWB_MODE_OFF). On devices that cannot, locking still freezes the
+     * auto-converged white balance via CONTROL_AWB_LOCK, just without a Kelvin dial.
+     */
+    data class WhiteBalance(
+        val locked: Boolean = false,
+        val temperatureK: Int = WB_DEFAULT_TEMPERATURE_K,
+        val manualGainsSupported: Boolean = false
+    )
+
     const val PREVIEW_MAX_EXPOSURE_NS = 66_666_666L 
     const val PREVIEW_MIN_FRAME_DURATION_NS = 33_333_333L 
+
+    const val WB_MIN_TEMPERATURE_K = 2000
+    const val WB_MAX_TEMPERATURE_K = 10000
+    const val WB_DEFAULT_TEMPERATURE_K = 4000
+    const val WB_TEMPERATURE_STEP_K = 100
+
+    /** Temperature that maps to unity gains, i.e. the sensor's daylight reference. */
+    const val WB_NEUTRAL_TEMPERATURE_K = 5000
+
+    /** Camera2 requires gains >= 1.0; cap the top end so no channel blows out. */
+    const val WB_MAX_CHANNEL_GAIN = 8.0f
+
+    const val WB_TEMPERATURE_PROGRESS_MAX =
+        (WB_MAX_TEMPERATURE_K - WB_MIN_TEMPERATURE_K) / WB_TEMPERATURE_STEP_K
+
+    // Floor on the modelled channel response so inverting it can never divide by ~0.
+    private const val WB_MIN_CHANNEL_RESPONSE = 0.05f
 
     fun calculateShutterSpeeds(minExp: Long, maxExp: Long): LongArray {
         val commonSpeeds = longArrayOf(
@@ -57,6 +103,127 @@ object CameraUtils {
     }
 
     /**
+     * Maps a white balance SeekBar position to a colour temperature in Kelvin.
+     */
+    fun calculateColorTemperature(progress: Int): Int {
+        val steps = progress.coerceIn(0, WB_TEMPERATURE_PROGRESS_MAX)
+        return WB_MIN_TEMPERATURE_K + steps * WB_TEMPERATURE_STEP_K
+    }
+
+    /**
+     * Inverse of [calculateColorTemperature], used to seed the SeekBar from a
+     * temperature that was measured or restored rather than dialled in by hand.
+     */
+    fun calculateTemperatureProgress(temperatureK: Int): Int {
+        val clamped = temperatureK.coerceIn(WB_MIN_TEMPERATURE_K, WB_MAX_TEMPERATURE_K)
+        return (clamped - WB_MIN_TEMPERATURE_K) / WB_TEMPERATURE_STEP_K
+    }
+
+    fun formatColorTemperature(temperatureK: Int): String {
+        return "${temperatureK}K"
+    }
+
+    /**
+     * Converts a colour temperature to raw per-channel gains.
+     *
+     * Gains are inversely proportional to the assumed illuminant's response and are
+     * expressed relative to [WB_NEUTRAL_TEMPERATURE_K], so the neutral temperature
+     * yields unity gains, lower temperatures cool the image, and higher temperatures
+     * warm it. The result is normalised so the smallest channel gain is exactly 1.0,
+     * as Camera2 requires every gain to be >= 1.0.
+     */
+    fun calculateWhiteBalanceGains(temperatureK: Int): WhiteBalanceGains {
+        val target = planckianResponse(temperatureK)
+        val reference = planckianResponse(WB_NEUTRAL_TEMPERATURE_K)
+
+        val red = reference[0] / target[0]
+        val green = reference[1] / target[1]
+        val blue = reference[2] / target[2]
+
+        val minGain = minOf(red, green, blue)
+        return WhiteBalanceGains(
+            red = normalizeGain(red, minGain),
+            green = normalizeGain(green, minGain),
+            blue = normalizeGain(blue, minGain)
+        )
+    }
+
+    /**
+     * Estimates the colour temperature that best explains a set of measured gains.
+     *
+     * This is the inverse of [calculateWhiteBalanceGains] and is used when the white
+     * balance lock engages: the currently converged auto gains are translated back to
+     * Kelvin so locking does not visibly shift colour before the user fine-tunes it.
+     * Matching happens on log channel ratios, which ignores overall brightness.
+     */
+    fun estimateColorTemperature(gains: WhiteBalanceGains): Int {
+        if (gains.red <= 0f || gains.green <= 0f || gains.blue <= 0f) {
+            return WB_DEFAULT_TEMPERATURE_K
+        }
+
+        val targetRedRatio = ln((gains.red / gains.green).toDouble())
+        val targetBlueRatio = ln((gains.blue / gains.green).toDouble())
+
+        var bestTemperature = WB_NEUTRAL_TEMPERATURE_K
+        var bestError = Double.MAX_VALUE
+        var temperatureK = WB_MIN_TEMPERATURE_K
+
+        while (temperatureK <= WB_MAX_TEMPERATURE_K) {
+            val candidate = calculateWhiteBalanceGains(temperatureK)
+            val redError = ln((candidate.red / candidate.green).toDouble()) - targetRedRatio
+            val blueError = ln((candidate.blue / candidate.green).toDouble()) - targetBlueRatio
+            val error = redError * redError + blueError * blueError
+            if (error < bestError) {
+                bestError = error
+                bestTemperature = temperatureK
+            }
+            temperatureK += WB_TEMPERATURE_STEP_K
+        }
+
+        return bestTemperature
+    }
+
+    /**
+     * Approximates the RGB response of a black-body illuminant, normalised to 0..1.
+     * Based on the widely used piecewise fit to the Planckian locus.
+     */
+    private fun planckianResponse(temperatureK: Int): FloatArray {
+        val temp = temperatureK.coerceIn(WB_MIN_TEMPERATURE_K, WB_MAX_TEMPERATURE_K) / 100.0
+
+        val red = if (temp <= 66.0) {
+            255.0
+        } else {
+            329.698727446 * (temp - 60.0).pow(-0.1332047592)
+        }
+
+        val green = if (temp <= 66.0) {
+            99.4708025861 * ln(temp) - 161.1195681661
+        } else {
+            288.1221695283 * (temp - 60.0).pow(-0.0755148492)
+        }
+
+        val blue = when {
+            temp >= 66.0 -> 255.0
+            temp <= 19.0 -> 0.0
+            else -> 138.5177312231 * ln(temp - 10.0) - 305.0447927307
+        }
+
+        return floatArrayOf(
+            normalizeResponse(red),
+            normalizeResponse(green),
+            normalizeResponse(blue)
+        )
+    }
+
+    private fun normalizeResponse(value: Double): Float {
+        return (value / 255.0).coerceIn(WB_MIN_CHANNEL_RESPONSE.toDouble(), 1.0).toFloat()
+    }
+
+    private fun normalizeGain(gain: Float, minGain: Float): Float {
+        return (gain / minGain).coerceIn(1f, WB_MAX_CHANNEL_GAIN)
+    }
+
+    /**
      * Applies manual settings to a CaptureRequest.Builder.
      */
     fun applyManualSettings(
@@ -86,6 +253,43 @@ object CameraUtils {
         builder.set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
         builder.set(CaptureRequest.CONTROL_AE_MODE, CaptureRequest.CONTROL_AE_MODE_ON)
         builder.set(CaptureRequest.CONTROL_AF_MODE, CaptureRequest.CONTROL_AF_MODE_CONTINUOUS_PICTURE)
+    }
+
+    /**
+     * Applies the white balance state to a CaptureRequest.Builder.
+     *
+     * This is deliberately independent of manual exposure mode: a nighttime sequence
+     * may want auto exposure but a frozen white balance. Because every still capture
+     * builds a fresh request, the lock has to be re-applied per frame — that is what
+     * stops AWB from re-converging (and shifting colour) between burst frames.
+     */
+    fun applyWhiteBalance(builder: CaptureRequest.Builder, whiteBalance: WhiteBalance) {
+        if (!whiteBalance.locked) {
+            // Restore device-driven colour correction; otherwise a previously locked
+            // preview builder would keep applying the stale transform matrix.
+            builder.set(CaptureRequest.CONTROL_AWB_LOCK, false)
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+            builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_FAST)
+            return
+        }
+
+        if (!whiteBalance.manualGainsSupported) {
+            // No manual gains on this device: freeze whatever AWB converged on.
+            builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_AUTO)
+            builder.set(CaptureRequest.CONTROL_AWB_LOCK, true)
+            builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_FAST)
+            return
+        }
+
+        val gains = calculateWhiteBalanceGains(whiteBalance.temperatureK)
+        // AWB_MODE_OFF with explicit gains is already frozen, so CONTROL_AWB_LOCK is
+        // not set here: that key is only meaningful while AWB_MODE is AUTO.
+        builder.set(CaptureRequest.CONTROL_AWB_MODE, CaptureRequest.CONTROL_AWB_MODE_OFF)
+        builder.set(CaptureRequest.COLOR_CORRECTION_MODE, CaptureRequest.COLOR_CORRECTION_MODE_TRANSFORM_MATRIX)
+        builder.set(
+            CaptureRequest.COLOR_CORRECTION_GAINS,
+            RggbChannelVector(gains.red, gains.green, gains.green, gains.blue)
+        )
     }
 
     fun getLensDescription(characteristics: CameraCharacteristics, cameraId: String): String {

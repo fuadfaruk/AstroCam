@@ -261,6 +261,51 @@
             android:id="@+id/focusDistanceSeekBar"
             android:layout_width="match_parent"
             android:layout_height="wrap_content" />
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:layout_marginTop="8dp">
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="White Balance: "
+                android:textColor="#B8C0CC"
+                android:textSize="13sp" />
+            <TextView
+                android:id="@+id/whiteBalanceValueText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Auto"
+                android:textColor="@android:color/white"
+                android:textStyle="bold"
+                android:textSize="13sp" />
+
+            <View
+                android:layout_width="0dp"
+                android:layout_height="1dp"
+                android:layout_weight="1" />
+
+            <androidx.appcompat.widget.SwitchCompat
+                android:id="@+id/whiteBalanceLockSwitch"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:contentDescription="Lock white balance for consistent colour across a sequence"
+                android:text="Lock"
+                android:textColor="@android:color/white"
+                android:textSize="13sp"
+                app:thumbTint="@color/switch_thumb_color"
+                app:trackTint="@color/switch_track_color" />
+        </LinearLayout>
+
+        <SeekBar
+            android:id="@+id/whiteBalanceSeekBar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:enabled="false"
+            android:max="80" />
     </LinearLayout>
 
     <ImageButton

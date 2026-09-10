@@ -65,6 +65,31 @@ class MainActivity : AppCompatActivity() {
     private val captureResults = mutableMapOf<Long, TotalCaptureResult>()
     private val capturedImages = mutableMapOf<Long, Image>()
 
+    // White balance state. Written from the camera background handler, read from the
+    // UI thread when the lock engages, hence @Volatile.
+    @Volatile private var latestAwbGains: CameraUtils.WhiteBalanceGains? = null
+    private var manualWhiteBalanceSupported = false
+    private var whiteBalanceLockSupported = false
+    private var whiteBalanceSetByUser = false
+
+    /**
+     * Samples the auto white balance the sensor converges on so that engaging the
+     * lock can start from the colour the user is already previewing.
+     */
+    private val previewCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
+        override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            val awbState = result.get(CaptureResult.CONTROL_AWB_STATE)
+            if (awbState != null &&
+                awbState != CameraMetadata.CONTROL_AWB_STATE_CONVERGED &&
+                awbState != CameraMetadata.CONTROL_AWB_STATE_LOCKED
+            ) {
+                return
+            }
+            val gains = result.get(CaptureResult.COLOR_CORRECTION_GAINS) ?: return
+            latestAwbGains = CameraUtils.WhiteBalanceGains(gains.red, gains.greenEven, gains.blue)
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         viewBinding = ActivityMainBinding.inflate(layoutInflater)
@@ -85,6 +110,7 @@ class MainActivity : AppCompatActivity() {
         setupRetractableControls()
         setupCameraSwitch()
         setupManualControls()
+        setupWhiteBalanceControls()
         setupTapToFocus()
     }
 
@@ -338,8 +364,9 @@ class MainActivity : AppCompatActivity() {
         } else {
             CameraUtils.applyAutoSettings(builder)
         }
+        CameraUtils.applyWhiteBalance(builder, getWhiteBalanceSettings())
         previewRequest = builder.build()
-        captureSession?.setRepeatingRequest(previewRequest!!, null, backgroundHandler)
+        captureSession?.setRepeatingRequest(previewRequest!!, previewCaptureCallback, backgroundHandler)
     }
 
     private fun closeCamera() {
@@ -351,6 +378,7 @@ class MainActivity : AppCompatActivity() {
             cameraDevice = null
             imageReader?.close()
             imageReader = null
+            latestAwbGains = null
         } catch (e: InterruptedException) {
             throw RuntimeException("Interrupted while trying to lock camera closing.", e)
         } finally {
@@ -359,6 +387,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCameraService() {
+        val whiteBalance = getWhiteBalanceSettings()
         val intent = Intent(this, CameraService::class.java).apply {
             action = CameraService.ACTION_UPDATE_SETTINGS
             putExtra(CameraService.EXTRA_MANUAL_MODE, viewBinding.manualModeSwitch.isChecked)
@@ -366,6 +395,9 @@ class MainActivity : AppCompatActivity() {
             putExtra(CameraService.EXTRA_ISO, viewBinding.isoSeekBar.progress)
             putExtra(CameraService.EXTRA_SHUTTER, getShutterSpeed())
             putExtra(CameraService.EXTRA_FOCUS, getFocusDistance())
+            putExtra(CameraService.EXTRA_WB_LOCKED, whiteBalance.locked)
+            putExtra(CameraService.EXTRA_WB_TEMPERATURE, whiteBalance.temperatureK)
+            putExtra(CameraService.EXTRA_WB_MANUAL_SUPPORTED, whiteBalance.manualGainsSupported)
             putExtra(CameraService.EXTRA_CAMERA_ID, cameraId)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
@@ -394,7 +426,8 @@ class MainActivity : AppCompatActivity() {
                     viewBinding.manualModeSwitch.isChecked,
                     viewBinding.isoSeekBar.progress,
                     getShutterSpeed(),
-                    getFocusDistance()
+                    getFocusDistance(),
+                    getWhiteBalanceSettings()
                 )
             )
 
@@ -482,6 +515,62 @@ class MainActivity : AppCompatActivity() {
         return CameraUtils.calculateFocusDistance(viewBinding.focusDistanceSeekBar.progress, minFocus)
     }
 
+    private fun getWhiteBalanceTemperature(): Int {
+        return CameraUtils.calculateColorTemperature(viewBinding.whiteBalanceSeekBar.progress)
+    }
+
+    private fun getWhiteBalanceSettings(): CameraUtils.WhiteBalance {
+        return CameraUtils.WhiteBalance(
+            locked = viewBinding.whiteBalanceLockSwitch.isChecked,
+            temperatureK = getWhiteBalanceTemperature(),
+            manualGainsSupported = manualWhiteBalanceSupported
+        )
+    }
+
+    private fun setupWhiteBalanceControls() {
+        // Seed the default from the shared constant so the UI cannot drift from the
+        // temperature the code assumes when no measurement is available.
+        viewBinding.whiteBalanceSeekBar.progress =
+            CameraUtils.calculateTemperatureProgress(CameraUtils.WB_DEFAULT_TEMPERATURE_K)
+
+        viewBinding.whiteBalanceSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                whiteBalanceSetByUser = true
+                applyCurrentSettingsToPreview()
+                updateSettingsTexts()
+            }
+            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
+            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+
+        // The lock is intentionally independent of the manual exposure switch: a
+        // nighttime sequence may run auto exposure but still needs frozen colour.
+        viewBinding.whiteBalanceLockSwitch.setOnCheckedChangeListener { _, isChecked ->
+            if (isChecked && !whiteBalanceSetByUser) {
+                seedWhiteBalanceFromAuto()
+            }
+            viewBinding.whiteBalanceSeekBar.isEnabled = isChecked && manualWhiteBalanceSupported
+            applyCurrentSettingsToPreview()
+            updateSettingsTexts()
+        }
+    }
+
+    /**
+     * Positions the slider at the temperature closest to the auto white balance the
+     * preview has converged on, so engaging the lock holds the current colour instead
+     * of jumping to an arbitrary default.
+     */
+    private fun seedWhiteBalanceFromAuto() {
+        val gains = latestAwbGains
+        val temperature = if (gains != null) {
+            CameraUtils.estimateColorTemperature(gains)
+        } else {
+            CameraUtils.WB_DEFAULT_TEMPERATURE_K
+        }
+        viewBinding.whiteBalanceSeekBar.progress = CameraUtils.calculateTemperatureProgress(temperature)
+    }
+
     private fun setupManualControls() {
         val onManualChanged = object : SeekBar.OnSeekBarChangeListener {
             override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
@@ -510,12 +599,27 @@ class MainActivity : AppCompatActivity() {
         val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
         val shutterRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
         val shutterSpeeds = CameraUtils.calculateShutterSpeeds(shutterRange?.lower ?: 100_000L, shutterRange?.upper ?: 1_000_000_000L)
-        
+
+        // Explicit colour gains need AWB_MODE_OFF. Devices without it can still hold
+        // colour steady through CONTROL_AWB_LOCK, just without a Kelvin dial.
+        manualWhiteBalanceSupported = characteristics.get(CameraCharacteristics.CONTROL_AWB_AVAILABLE_MODES)
+            ?.contains(CameraMetadata.CONTROL_AWB_MODE_OFF) ?: false
+        whiteBalanceLockSupported = characteristics.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) ?: false
+        val canLockWhiteBalance = manualWhiteBalanceSupported || whiteBalanceLockSupported
+
         runOnUiThread {
             viewBinding.shutterSpeedSeekBar.max = if (shutterSpeeds.isNotEmpty()) shutterSpeeds.size - 1 else 0
             viewBinding.isoSeekBar.min = isoRange?.lower ?: 100
             viewBinding.isoSeekBar.max = isoRange?.upper ?: 3200
             viewBinding.focusDistanceSeekBar.max = 100
+
+            viewBinding.whiteBalanceSeekBar.max = CameraUtils.WB_TEMPERATURE_PROGRESS_MAX
+            viewBinding.whiteBalanceLockSwitch.isEnabled = canLockWhiteBalance
+            viewBinding.whiteBalanceLockSwitch.alpha = if (canLockWhiteBalance) 1.0f else 0.5f
+            if (!canLockWhiteBalance) viewBinding.whiteBalanceLockSwitch.isChecked = false
+            viewBinding.whiteBalanceSeekBar.isEnabled =
+                viewBinding.whiteBalanceLockSwitch.isChecked && manualWhiteBalanceSupported
+
             updateSettingsTexts()
         }
     }
@@ -532,6 +636,12 @@ class MainActivity : AppCompatActivity() {
             viewBinding.isoValueText.text = getString(R.string.auto)
             viewBinding.shutterSpeedValueText.text = getString(R.string.auto)
             viewBinding.focusDistanceValueText.text = getString(R.string.auto)
+        }
+
+        viewBinding.whiteBalanceValueText.text = when {
+            !viewBinding.whiteBalanceLockSwitch.isChecked -> getString(R.string.auto)
+            manualWhiteBalanceSupported -> CameraUtils.formatColorTemperature(getWhiteBalanceTemperature())
+            else -> getString(R.string.locked)
         }
     }
 
@@ -551,6 +661,8 @@ class MainActivity : AppCompatActivity() {
         viewBinding.switchCameraButton.setOnClickListener {
             if (cameraIds.size > 1) {
                 cameraIndex = (cameraIndex + 1) % cameraIds.size
+                // Colour gains are sensor-specific, so let the new camera re-seed.
+                whiteBalanceSetByUser = false
                 closeCamera()
                 openCamera(viewBinding.viewFinder.width, viewBinding.viewFinder.height)
             }
@@ -620,7 +732,7 @@ class MainActivity : AppCompatActivity() {
             session.capture(builder.build(), null, backgroundHandler)
 
             builder.set(CaptureRequest.CONTROL_AF_TRIGGER, CameraMetadata.CONTROL_AF_TRIGGER_IDLE)
-            session.setRepeatingRequest(builder.build(), null, backgroundHandler)
+            session.setRepeatingRequest(builder.build(), previewCaptureCallback, backgroundHandler)
 
         } catch (e: CameraAccessException) {
             Log.e(TAG, "Failed to set focus area", e)
