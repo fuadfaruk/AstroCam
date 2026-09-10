@@ -68,6 +68,50 @@ object CameraUtils {
     // Floor on the modelled channel response so inverting it can never divide by ~0.
     private const val WB_MIN_CHANNEL_RESPONSE = 0.05f
 
+    /** Sensible starting sensitivity before the device reports its own range. */
+    const val DEFAULT_ISO = 400
+
+    /**
+     * Canonical one-third-stop ISO series.
+     *
+     * The sensor exposes a continuous SENSOR_INFO_SENSITIVITY_RANGE, but exposing
+     * every integer as a track position makes exact values unreachable. Photographers
+     * think in stops, so the manual control indexes into this table instead.
+     */
+    private val ISO_THIRD_STOPS = intArrayOf(
+        25, 32, 40, 50, 64, 80,
+        100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250,
+        1600, 2000, 2500, 3200, 4000, 5000, 6400, 8000, 10000, 12800,
+        16000, 20000, 25600, 32000, 40000, 51200, 64000, 80000, 102400,
+        128000, 160000, 204800, 256000, 320000, 409600
+    )
+
+    /**
+     * Quantizes the device's continuous sensitivity range to the one-third-stop ISO
+     * series. The device's exact bounds are appended when they fall between stops so
+     * no reachable sensitivity is lost at either end.
+     */
+    fun calculateIsoStops(minIso: Int, maxIso: Int): IntArray {
+        if (maxIso < minIso) return intArrayOf(minIso)
+
+        val stops = ISO_THIRD_STOPS.filter { it in minIso..maxIso }.toMutableList()
+        if (stops.isEmpty()) {
+            stops.add(minIso)
+            if (maxIso > minIso) stops.add(maxIso)
+            return stops.toIntArray()
+        }
+        if (minIso < stops.first()) stops.add(0, minIso)
+        if (maxIso > stops.last()) stops.add(maxIso)
+        return stops.toIntArray()
+    }
+
+    /**
+     * Resolution of the manual focus control. Focus is expressed in diopters, and the
+     * astro-relevant range near infinity occupies only a sliver of a 0..100 track, so
+     * the control uses a finer 0..[FOCUS_PROGRESS_MAX] scale instead.
+     */
+    const val FOCUS_PROGRESS_MAX = 1000
+
     fun calculateShutterSpeeds(minExp: Long, maxExp: Long): LongArray {
         val commonSpeeds = longArrayOf(
             1_000_000L, 2_000_000L, 4_000_000L, 8_000_000L, 16_666_666L, 33_333_333L, 66_666_666L,
@@ -90,8 +134,64 @@ object CameraUtils {
         }
     }
 
+    /**
+     * Maps a focus-control position to a lens focus distance in diopters.
+     *
+     * Progress runs from 0 (closest focus, the largest diopter value) to
+     * [FOCUS_PROGRESS_MAX] (infinity, zero diopters).
+     */
     fun calculateFocusDistance(progress: Int, minFocus: Float): Float {
-        return (1.0f - progress.coerceIn(0, 100) / 100f) * minFocus
+        return calculateFocusDistance(progress, FOCUS_PROGRESS_MAX, minFocus)
+    }
+
+    fun calculateFocusDistance(progress: Int, progressMax: Int, minFocus: Float): Float {
+        if (progressMax <= 0) return 0f
+        return (1.0f - progress.coerceIn(0, progressMax).toFloat() / progressMax) * minFocus
+    }
+
+    /**
+     * Renders a diopter focus distance the way a photographer reads it: infinity,
+     * metres for far subjects, centimetres for near ones. This is what makes the
+     * infinity end of the focus track legible instead of a raw float.
+     */
+    fun formatFocusDistance(diopters: Float): String {
+        if (diopters <= 0.0001f) return "∞"
+        val meters = 1.0f / diopters
+        return if (meters >= 1.0f) {
+            String.format(Locale.US, "%.1fm", meters)
+        } else {
+            String.format(Locale.US, "%.0fcm", meters * 100.0f)
+        }
+    }
+
+    /** Index of the entry closest to [target], for seeding a control from a default. */
+    fun indexOfNearest(values: IntArray, target: Int): Int {
+        if (values.isEmpty()) return 0
+        var bestIndex = 0
+        var bestDistance = Long.MAX_VALUE
+        values.forEachIndexed { index, value ->
+            val distance = kotlin.math.abs(value.toLong() - target)
+            if (distance < bestDistance) {
+                bestDistance = distance
+                bestIndex = index
+            }
+        }
+        return bestIndex
+    }
+
+    /** Index of the entry closest to [target], for seeding a control from a default. */
+    fun indexOfNearest(values: LongArray, target: Long): Int {
+        if (values.isEmpty()) return 0
+        var bestIndex = 0
+        var bestDistance = Long.MAX_VALUE
+        values.forEachIndexed { index, value ->
+            val distance = kotlin.math.abs(value - target)
+            if (distance < bestDistance) {
+                bestDistance = distance
+                bestIndex = index
+            }
+        }
+        return bestIndex
     }
 
     fun getPreviewExposureTime(shutterSpeed: Long): Long {
@@ -103,7 +203,7 @@ object CameraUtils {
     }
 
     /**
-     * Maps a white balance SeekBar position to a colour temperature in Kelvin.
+     * Maps a white balance slider position to a colour temperature in Kelvin.
      */
     fun calculateColorTemperature(progress: Int): Int {
         val steps = progress.coerceIn(0, WB_TEMPERATURE_PROGRESS_MAX)
@@ -111,7 +211,7 @@ object CameraUtils {
     }
 
     /**
-     * Inverse of [calculateColorTemperature], used to seed the SeekBar from a
+     * Inverse of [calculateColorTemperature], used to seed the slider from a
      * temperature that was measured or restored rather than dialled in by hand.
      */
     fun calculateTemperatureProgress(temperatureK: Int): Int {

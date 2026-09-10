@@ -1,17 +1,38 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <!-- Base application theme. -->
+    <!-- Base application theme. The app is used in the dark, so the palette is a
+         fixed low-luminance one rather than the stock template purple/teal. -->
     <style name="Theme.AstroCam" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <!-- Primary brand color. -->
-        <item name="colorPrimary">@color/purple_200</item>
-        <item name="colorPrimaryVariant">@color/purple_700</item>
-        <item name="colorOnPrimary">@color/black</item>
-        <!-- Secondary brand color. -->
-        <item name="colorSecondary">@color/teal_200</item>
-        <item name="colorSecondaryVariant">@color/teal_700</item>
-        <item name="colorOnSecondary">@color/black</item>
-        <!-- Status bar color. -->
+        <item name="colorPrimary">@color/night_accent</item>
+        <item name="colorPrimaryVariant">@color/night_accent_variant</item>
+        <item name="colorOnPrimary">@android:color/black</item>
+        <item name="colorSecondary">@color/night_accent</item>
+        <item name="colorSecondaryVariant">@color/night_accent_variant</item>
+        <item name="colorOnSecondary">@android:color/black</item>
+        <!-- Surfaces feed the Slider ticks/labels and any Material widget without an
+             explicit tint, so they must be dark too. -->
+        <item name="colorSurface">@color/control_surface</item>
+        <item name="colorOnSurface">@color/control_on_surface</item>
+        <item name="colorOnSurfaceVariant">@color/control_on_surface_variant</item>
+        <item name="android:windowBackground">@android:color/black</item>
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
         <item name="android:windowLightStatusBar" tools:targetApi="m">false</item>
+    </style>
+
+    <!-- Discrete manual-control slider. Centralising the tints here keeps every
+         slider off the stock purple accent and matches the existing switch colours. -->
+    <style name="Widget.AstroCam.Slider" parent="Widget.MaterialComponents.Slider">
+        <item name="thumbColor">@color/slider_thumb_color</item>
+        <item name="trackColorActive">@color/slider_track_active</item>
+        <item name="trackColorInactive">@color/slider_track_inactive</item>
+        <item name="tickColorActive">@color/slider_tick_active</item>
+        <item name="tickColorInactive">@color/slider_tick_inactive</item>
+        <item name="haloColor">@color/slider_halo</item>
+        <item name="labelStyle">@style/Widget.AstroCam.Slider.Tooltip</item>
+    </style>
+
+    <style name="Widget.AstroCam.Slider.Tooltip" parent="Widget.MaterialComponents.Tooltip">
+        <item name="backgroundTint">@color/control_surface</item>
+        <item name="android:textColor">@color/control_on_surface</item>
     </style>
 </resources>

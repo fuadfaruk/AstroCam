@@ -47,18 +47,40 @@ class CameraUtilsTest {
     }
 
     @Test
-    fun `calculateFocusDistance at progress 0`() {
+    fun `calculateFocusDistance at progress 0 is the closest focus`() {
         assertEquals(10.0f, CameraUtils.calculateFocusDistance(0, 10.0f), 0.001f)
     }
 
     @Test
-    fun `calculateFocusDistance at progress 100`() {
-        assertEquals(0.0f, CameraUtils.calculateFocusDistance(100, 10.0f), 0.001f)
+    fun `calculateFocusDistance at max progress is infinity`() {
+        assertEquals(0.0f, CameraUtils.calculateFocusDistance(CameraUtils.FOCUS_PROGRESS_MAX, 10.0f), 0.001f)
     }
 
     @Test
-    fun `calculateFocusDistance at progress 50`() {
-        assertEquals(5.0f, CameraUtils.calculateFocusDistance(50, 10.0f), 0.001f)
+    fun `calculateFocusDistance at half progress is half the diopter range`() {
+        assertEquals(5.0f, CameraUtils.calculateFocusDistance(CameraUtils.FOCUS_PROGRESS_MAX / 2, 10.0f), 0.001f)
+    }
+
+    @Test
+    fun `calculateFocusDistance clamps out of range progress`() {
+        assertEquals(10.0f, CameraUtils.calculateFocusDistance(-50, 10.0f), 0.001f)
+        assertEquals(0.0f, CameraUtils.calculateFocusDistance(CameraUtils.FOCUS_PROGRESS_MAX + 50, 10.0f), 0.001f)
+    }
+
+    @Test
+    fun `formatFocusDistance shows infinity at zero diopters`() {
+        assertEquals("∞", CameraUtils.formatFocusDistance(0f))
+    }
+
+    @Test
+    fun `formatFocusDistance shows metres for distant subjects`() {
+        assertEquals("1.0m", CameraUtils.formatFocusDistance(1.0f))
+        assertEquals("2.0m", CameraUtils.formatFocusDistance(0.5f))
+    }
+
+    @Test
+    fun `formatFocusDistance shows centimetres for near subjects`() {
+        assertEquals("50cm", CameraUtils.formatFocusDistance(2.0f))
     }
 
     @Test
@@ -203,5 +225,71 @@ class CameraUtilsTest {
     @Test
     fun `formatColorTemperature appends the Kelvin unit`() {
         assertEquals("4000K", CameraUtils.formatColorTemperature(4000))
+    }
+
+    @Test
+    fun `calculateIsoStops stays within the device range`() {
+        val stops = CameraUtils.calculateIsoStops(100, 3200)
+
+        assertTrue(stops.isNotEmpty())
+        assertTrue(stops.all { it in 100..3200 })
+    }
+
+    @Test
+    fun `calculateIsoStops includes standard third stops`() {
+        val stops = CameraUtils.calculateIsoStops(100, 1600)
+
+        assertTrue(stops.contains(100))
+        assertTrue(stops.contains(125))
+        assertTrue(stops.contains(160))
+        assertTrue(stops.contains(400))
+        assertTrue(stops.contains(1600))
+    }
+
+    @Test
+    fun `calculateIsoStops is strictly ascending`() {
+        val stops = CameraUtils.calculateIsoStops(50, 12800)
+
+        for (i in 1 until stops.size) {
+            assertTrue("stop $i must exceed the previous", stops[i] > stops[i - 1])
+        }
+    }
+
+    @Test
+    fun `calculateIsoStops appends the exact device maximum`() {
+        // 8192 is not a standard stop, so it must still be reachable.
+        val stops = CameraUtils.calculateIsoStops(100, 8192)
+
+        assertEquals(8192, stops.last())
+    }
+
+    @Test
+    fun `calculateIsoStops appends the exact device minimum when below the series`() {
+        val stops = CameraUtils.calculateIsoStops(60, 800)
+
+        assertEquals(60, stops.first())
+    }
+
+    @Test
+    fun `calculateIsoStops falls back to device bounds outside the series`() {
+        val stops = CameraUtils.calculateIsoStops(500_000, 800_000)
+
+        assertArrayEquals(intArrayOf(500_000, 800_000), stops)
+    }
+
+    @Test
+    fun `indexOfNearest picks the closest int entry`() {
+        val values = intArrayOf(100, 200, 400, 800)
+
+        assertEquals(2, CameraUtils.indexOfNearest(values, 410))
+        assertEquals(0, CameraUtils.indexOfNearest(values, 10))
+        assertEquals(3, CameraUtils.indexOfNearest(values, 100000))
+    }
+
+    @Test
+    fun `indexOfNearest picks the closest long entry`() {
+        val values = longArrayOf(1_000_000L, 16_666_666L, 1_000_000_000L)
+
+        assertEquals(1, CameraUtils.indexOfNearest(values, 16_000_000L))
     }
 }

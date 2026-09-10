@@ -7,4 +7,17 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+
+    <!-- Low-luminance night palette. Everything the manual controls tint themselves
+         from lives here so no widget falls back to the stock purple accent. -->
+    <color name="night_accent">#8AB4F8</color>
+    <color name="night_accent_variant">#4A6984</color>
+    <color name="control_surface">#1E1E24</color>
+    <color name="control_on_surface">#FFFFFF</color>
+    <color name="control_on_surface_variant">#B8C0CC</color>
+    <color name="slider_track_active">#8AB4F8</color>
+    <color name="slider_track_inactive">#3F4148</color>
+    <color name="slider_tick_active">#8AB4F8</color>
+    <color name="slider_tick_inactive">#6A7078</color>
+    <color name="slider_halo">#338AB4F8</color>
 </resources>

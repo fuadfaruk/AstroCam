@@ -19,18 +19,19 @@ import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import android.util.Size
+import android.view.HapticFeedbackConstants
 import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.Surface
 import android.view.TextureView
 import android.view.WindowManager
-import android.widget.SeekBar
 import android.widget.Toast
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.isVisible
 import com.cusapps.astrocam.databinding.ActivityMainBinding
+import com.google.android.material.slider.Slider
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
@@ -71,6 +72,19 @@ class MainActivity : AppCompatActivity() {
     private var manualWhiteBalanceSupported = false
     private var whiteBalanceLockSupported = false
     private var whiteBalanceSetByUser = false
+
+    // Manual control domains. These are camera-specific, so they are cached when the
+    // camera opens instead of being re-read from CameraManager on every slider step.
+    // @Volatile because the capture session can configure on the camera thread and
+    // resolves them through the getters.
+    @Volatile private var isoStops: IntArray = intArrayOf()
+    @Volatile private var shutterSpeeds: LongArray = longArrayOf()
+    @Volatile private var minFocusDistance = 0f
+    @Volatile private var focusAvailable = false
+
+    // Stepper-backed values, replacing the old timer/burst sliders.
+    private var timerSeconds = 0
+    private var burstCount = 1
 
     /**
      * Samples the auto white balance the sensor converges on so that engaging the
@@ -360,7 +374,7 @@ class MainActivity : AppCompatActivity() {
     private fun applyCurrentSettingsToPreview() {
         val builder = previewRequestBuilder ?: return
         if (viewBinding.manualModeSwitch.isChecked) {
-            CameraUtils.applyManualSettings(builder, viewBinding.isoSeekBar.progress, getShutterSpeed(), getFocusDistance(), false)
+            CameraUtils.applyManualSettings(builder, getIso(), getShutterSpeed(), getFocusDistance(), false)
         } else {
             CameraUtils.applyAutoSettings(builder)
         }
@@ -392,7 +406,7 @@ class MainActivity : AppCompatActivity() {
             action = CameraService.ACTION_UPDATE_SETTINGS
             putExtra(CameraService.EXTRA_MANUAL_MODE, viewBinding.manualModeSwitch.isChecked)
             putExtra(CameraService.EXTRA_RAW_MODE, viewBinding.rawModeSwitch.isChecked)
-            putExtra(CameraService.EXTRA_ISO, viewBinding.isoSeekBar.progress)
+            putExtra(CameraService.EXTRA_ISO, getIso())
             putExtra(CameraService.EXTRA_SHUTTER, getShutterSpeed())
             putExtra(CameraService.EXTRA_FOCUS, getFocusDistance())
             putExtra(CameraService.EXTRA_WB_LOCKED, whiteBalance.locked)
@@ -424,7 +438,7 @@ class MainActivity : AppCompatActivity() {
                 listOf(reader.surface),
                 PhotoCaptureHelper.CaptureSettings(
                     viewBinding.manualModeSwitch.isChecked,
-                    viewBinding.isoSeekBar.progress,
+                    getIso(),
                     getShutterSpeed(),
                     getFocusDistance(),
                     getWhiteBalanceSettings()
@@ -459,7 +473,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startPhotoTimer() {
-        val timerSeconds = viewBinding.timerSeekBar.progress
         if (timerSeconds == 0) {
             takeBurstPhotos()
             return
@@ -478,7 +491,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun takeBurstPhotos() {
-        val burstCount = viewBinding.burstSeekBar.progress + 1
         var capturedCount = 0
         fun captureNext() {
             if (capturedCount < burstCount) {
@@ -501,22 +513,27 @@ class MainActivity : AppCompatActivity() {
         viewBinding.flashOverlay.animate().alpha(0f).setDuration(100).withEndAction { viewBinding.flashOverlay.isVisible = false }.start()
     }
 
+    private fun getIso(): Int {
+        if (isoStops.isEmpty()) return CameraUtils.DEFAULT_ISO
+        val index = viewBinding.isoSlider.value.toInt()
+        return isoStops.getOrNull(index) ?: isoStops.last()
+    }
+
     private fun getShutterSpeed(): Long {
-        val speeds = getShutterSpeedsArray()
-        if (speeds.isEmpty()) return 0L
-        val progress = viewBinding.shutterSpeedSeekBar.progress
-        return if (progress in speeds.indices) speeds[progress] else speeds.last()
+        if (shutterSpeeds.isEmpty()) return 0L
+        val index = viewBinding.shutterSlider.value.toInt()
+        return shutterSpeeds.getOrNull(index) ?: shutterSpeeds.last()
     }
 
     private fun getFocusDistance(): Float {
-        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val characteristics = manager.getCameraCharacteristics(cameraId ?: return 0f)
-        val minFocus = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
-        return CameraUtils.calculateFocusDistance(viewBinding.focusDistanceSeekBar.progress, minFocus)
+        return CameraUtils.calculateFocusDistance(
+            viewBinding.focusSlider.value.toInt(),
+            minFocusDistance
+        )
     }
 
     private fun getWhiteBalanceTemperature(): Int {
-        return CameraUtils.calculateColorTemperature(viewBinding.whiteBalanceSeekBar.progress)
+        return CameraUtils.calculateColorTemperature(viewBinding.whiteBalanceSlider.value.toInt())
     }
 
     private fun getWhiteBalanceSettings(): CameraUtils.WhiteBalance {
@@ -530,18 +547,26 @@ class MainActivity : AppCompatActivity() {
     private fun setupWhiteBalanceControls() {
         // Seed the default from the shared constant so the UI cannot drift from the
         // temperature the code assumes when no measurement is available.
-        viewBinding.whiteBalanceSeekBar.progress =
-            CameraUtils.calculateTemperatureProgress(CameraUtils.WB_DEFAULT_TEMPERATURE_K)
+        configureSlider(
+            viewBinding.whiteBalanceSlider,
+            CameraUtils.WB_TEMPERATURE_PROGRESS_MAX + 1,
+            CameraUtils.calculateTemperatureProgress(CameraUtils.WB_DEFAULT_TEMPERATURE_K),
+            enabled = false
+        )
 
-        viewBinding.whiteBalanceSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
+        viewBinding.whiteBalanceSlider.addOnChangeListener(object : Slider.OnChangeListener {
+            override fun onValueChange(slider: Slider, value: Float, fromUser: Boolean) {
                 if (!fromUser) return
                 whiteBalanceSetByUser = true
-                applyCurrentSettingsToPreview()
                 updateSettingsTexts()
             }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        })
+        viewBinding.whiteBalanceSlider.addOnSliderTouchListener(object : Slider.OnSliderTouchListener {
+            override fun onStartTrackingTouch(slider: Slider) {}
+            override fun onStopTrackingTouch(slider: Slider) {
+                // Commit once per gesture rather than once per Kelvin step.
+                if (slider.isEnabled) applyCurrentSettingsToPreview()
+            }
         })
 
         // The lock is intentionally independent of the manual exposure switch: a
@@ -550,7 +575,7 @@ class MainActivity : AppCompatActivity() {
             if (isChecked && !whiteBalanceSetByUser) {
                 seedWhiteBalanceFromAuto()
             }
-            viewBinding.whiteBalanceSeekBar.isEnabled = isChecked && manualWhiteBalanceSupported
+            viewBinding.whiteBalanceSlider.isEnabled = isChecked && manualWhiteBalanceSupported
             applyCurrentSettingsToPreview()
             updateSettingsTexts()
         }
@@ -568,37 +593,107 @@ class MainActivity : AppCompatActivity() {
         } else {
             CameraUtils.WB_DEFAULT_TEMPERATURE_K
         }
-        viewBinding.whiteBalanceSeekBar.progress = CameraUtils.calculateTemperatureProgress(temperature)
+        viewBinding.whiteBalanceSlider.value = CameraUtils.calculateTemperatureProgress(temperature).toFloat()
     }
 
     private fun setupManualControls() {
-        val onManualChanged = object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) {
-                if (fromUser && viewBinding.manualModeSwitch.isChecked) {
-                    applyCurrentSettingsToPreview()
-                    updateSettingsTexts()
-                }
-            }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
+        // Label formatters render the selected stop in the drag bubble, which is what
+        // makes the controls usable without reading the tiny value row.
+        viewBinding.isoSlider.setLabelFormatter { value ->
+            isoStops.getOrNull(value.toInt())?.toString() ?: ""
         }
-        viewBinding.isoSeekBar.setOnSeekBarChangeListener(onManualChanged)
-        viewBinding.shutterSpeedSeekBar.setOnSeekBarChangeListener(onManualChanged)
-        viewBinding.focusDistanceSeekBar.setOnSeekBarChangeListener(onManualChanged)
+        viewBinding.shutterSlider.setLabelFormatter { value ->
+            shutterSpeeds.getOrNull(value.toInt())
+                ?.let { CameraUtils.formatShutterSpeed(it) } ?: ""
+        }
+        viewBinding.focusSlider.setLabelFormatter { value ->
+            CameraUtils.formatFocusDistance(
+                CameraUtils.calculateFocusDistance(value.toInt(), minFocusDistance)
+            )
+        }
 
-        viewBinding.manualModeSwitch.setOnCheckedChangeListener { _, isChecked ->
-            viewBinding.isoSeekBar.isEnabled = isChecked
-            viewBinding.shutterSpeedSeekBar.isEnabled = isChecked
-            viewBinding.focusDistanceSeekBar.isEnabled = isChecked
+        val manualChangeListener = object : Slider.OnChangeListener {
+            override fun onValueChange(slider: Slider, value: Float, fromUser: Boolean) {
+                if (fromUser) updateSettingsTexts()
+            }
+        }
+        viewBinding.isoSlider.addOnChangeListener(manualChangeListener)
+        viewBinding.shutterSlider.addOnChangeListener(manualChangeListener)
+        viewBinding.focusSlider.addOnChangeListener(manualChangeListener)
+
+        // Commit once per gesture. A full drag emits a handful of requests instead of
+        // one setRepeatingRequest per pixel of finger travel.
+        val commitListener = object : Slider.OnSliderTouchListener {
+            override fun onStartTrackingTouch(slider: Slider) {}
+            override fun onStopTrackingTouch(slider: Slider) {
+                if (viewBinding.manualModeSwitch.isChecked) applyCurrentSettingsToPreview()
+            }
+        }
+        viewBinding.isoSlider.addOnSliderTouchListener(commitListener)
+        viewBinding.shutterSlider.addOnSliderTouchListener(commitListener)
+        viewBinding.focusSlider.addOnSliderTouchListener(commitListener)
+
+        viewBinding.manualModeSwitch.setOnCheckedChangeListener { _, _ ->
+            updateManualControlEnabledState()
             applyCurrentSettingsToPreview()
             updateSettingsTexts()
+        }
+
+        // Infinity, then fine nudges: the two moves astro focusing actually needs.
+        viewBinding.focusInfinityButton.setOnClickListener { nudgeFocus(0) }
+        viewBinding.focusDecreaseButton.setOnClickListener { nudgeFocus(-1) }
+        viewBinding.focusIncreaseButton.setOnClickListener { nudgeFocus(1) }
+    }
+
+    /**
+     * Moves the focus control by [delta] steps, or straight to infinity when [delta]
+     * is 0, then applies it immediately since there is no drag to release.
+     */
+    private fun nudgeFocus(delta: Int) {
+        val current = viewBinding.focusSlider.value.toInt()
+        val target = if (delta == 0) CameraUtils.FOCUS_PROGRESS_MAX else current + delta
+        viewBinding.focusSlider.value = target
+            .coerceIn(0, CameraUtils.FOCUS_PROGRESS_MAX)
+            .toFloat()
+        viewBinding.focusInfinityButton.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+        updateSettingsTexts()
+        if (viewBinding.manualModeSwitch.isChecked && focusAvailable) {
+            applyCurrentSettingsToPreview()
+        }
+    }
+
+    private fun updateManualControlEnabledState() {
+        val manual = viewBinding.manualModeSwitch.isChecked
+        viewBinding.isoSlider.isEnabled = manual && isoStops.size > 1
+        viewBinding.shutterSlider.isEnabled = manual && shutterSpeeds.size > 1
+        setFocusControlsEnabled(manual && focusAvailable)
+    }
+
+    private fun setFocusControlsEnabled(enabled: Boolean) {
+        viewBinding.focusSlider.isEnabled = enabled
+        val buttons = listOf(
+            viewBinding.focusInfinityButton,
+            viewBinding.focusDecreaseButton,
+            viewBinding.focusIncreaseButton
+        )
+        buttons.forEach {
+            it.isEnabled = enabled
+            it.alpha = if (enabled) 1.0f else 0.5f
         }
     }
 
     private fun updateManualControlsUI(characteristics: CameraCharacteristics) {
         val isoRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
         val shutterRange = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-        val shutterSpeeds = CameraUtils.calculateShutterSpeeds(shutterRange?.lower ?: 100_000L, shutterRange?.upper ?: 1_000_000_000L)
+        val computedShutterSpeeds = CameraUtils.calculateShutterSpeeds(
+            shutterRange?.lower ?: 100_000L,
+            shutterRange?.upper ?: 1_000_000_000L
+        )
+        val computedIsoStops = CameraUtils.calculateIsoStops(
+            isoRange?.lower ?: 100,
+            isoRange?.upper ?: 3200
+        )
+        val computedMinFocus = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
 
         // Explicit colour gains need AWB_MODE_OFF. Devices without it can still hold
         // colour steady through CONTROL_AWB_LOCK, just without a Kelvin dial.
@@ -607,31 +702,75 @@ class MainActivity : AppCompatActivity() {
         whiteBalanceLockSupported = characteristics.get(CameraCharacteristics.CONTROL_AWB_LOCK_AVAILABLE) ?: false
         val canLockWhiteBalance = manualWhiteBalanceSupported || whiteBalanceLockSupported
 
-        runOnUiThread {
-            viewBinding.shutterSpeedSeekBar.max = if (shutterSpeeds.isNotEmpty()) shutterSpeeds.size - 1 else 0
-            viewBinding.isoSeekBar.min = isoRange?.lower ?: 100
-            viewBinding.isoSeekBar.max = isoRange?.upper ?: 3200
-            viewBinding.focusDistanceSeekBar.max = 100
+        // Publish the domains before touching the UI: the capture session can come up
+        // on the camera thread and resolves them through the getters.
+        shutterSpeeds = computedShutterSpeeds
+        isoStops = computedIsoStops
+        minFocusDistance = computedMinFocus
+        // A fixed-focus lens reports 0 diopters; there is nothing to drive, so the
+        // focus controls are disabled rather than left looking functional.
+        focusAvailable = computedMinFocus > 0f
 
-            viewBinding.whiteBalanceSeekBar.max = CameraUtils.WB_TEMPERATURE_PROGRESS_MAX
+        runOnUiThread {
+            // Manual mode starts disabled; these configure the stage for when it is on.
+            configureSlider(
+                viewBinding.shutterSlider,
+                computedShutterSpeeds.size,
+                CameraUtils.indexOfNearest(computedShutterSpeeds, 16_666_666L)
+            )
+            configureSlider(
+                viewBinding.isoSlider,
+                computedIsoStops.size,
+                CameraUtils.indexOfNearest(computedIsoStops, CameraUtils.DEFAULT_ISO)
+            )
+            configureSlider(
+                viewBinding.focusSlider,
+                CameraUtils.FOCUS_PROGRESS_MAX + 1,
+                CameraUtils.FOCUS_PROGRESS_MAX
+            )
+
+            // White balance is not reconfigured here: its range is a constant, and
+            // re-seeding it on every camera open would discard the user's choice.
             viewBinding.whiteBalanceLockSwitch.isEnabled = canLockWhiteBalance
             viewBinding.whiteBalanceLockSwitch.alpha = if (canLockWhiteBalance) 1.0f else 0.5f
             if (!canLockWhiteBalance) viewBinding.whiteBalanceLockSwitch.isChecked = false
-            viewBinding.whiteBalanceSeekBar.isEnabled =
+            viewBinding.whiteBalanceSlider.isEnabled =
                 viewBinding.whiteBalanceLockSwitch.isChecked && manualWhiteBalanceSupported
 
+            updateManualControlEnabledState()
             updateSettingsTexts()
         }
     }
 
+    /**
+     * Re-points a discrete slider at a new index domain.
+     *
+     * The value is parked at the minimum before the range changes so a smaller [count]
+     * can never leave the current value above the new maximum, which Material Slider
+     * rejects. A single-entry domain has no meaningful track, so it is disabled.
+     */
+    private fun configureSlider(slider: Slider, count: Int, valueIndex: Int, enabled: Boolean = true) {
+        if (count <= 1) {
+            slider.isEnabled = false
+            return
+        }
+        if (slider.value != slider.valueFrom) {
+            slider.value = slider.valueFrom
+        }
+        slider.stepSize = 1f
+        slider.valueFrom = 0f
+        slider.valueTo = (count - 1).toFloat()
+        slider.value = valueIndex.coerceIn(0, count - 1).toFloat()
+        slider.isEnabled = enabled
+    }
+
     private fun updateSettingsTexts() {
         if (viewBinding.manualModeSwitch.isChecked) {
-            viewBinding.isoValueText.text = viewBinding.isoSeekBar.progress.toString()
-            val speeds = getShutterSpeedsArray()
-            if (speeds.isNotEmpty()) {
+            viewBinding.isoValueText.text = getIso().toString()
+            if (shutterSpeeds.isNotEmpty()) {
                 viewBinding.shutterSpeedValueText.text = CameraUtils.formatShutterSpeed(getShutterSpeed())
             }
-            viewBinding.focusDistanceValueText.text = String.format(Locale.US, "%.2f", getFocusDistance())
+            viewBinding.focusDistanceValueText.text = CameraUtils.formatFocusDistance(getFocusDistance())
         } else {
             viewBinding.isoValueText.text = getString(R.string.auto)
             viewBinding.shutterSpeedValueText.text = getString(R.string.auto)
@@ -645,16 +784,10 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun getShutterSpeedsArray(): LongArray {
-        if (cameraId == null) return longArrayOf()
-        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-        val characteristics = manager.getCameraCharacteristics(cameraId!!)
-        val range = characteristics.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
-        return CameraUtils.calculateShutterSpeeds(range?.lower ?: 100_000L, range?.upper ?: 1_000_000_000L)
-    }
-
     private fun setupRetractableControls() {
-        viewBinding.toggleControlsButton.setOnClickListener { viewBinding.controls.isVisible = !viewBinding.controls.isVisible }
+        viewBinding.toggleControlsButton.setOnClickListener {
+            viewBinding.controlsScroll.isVisible = !viewBinding.controlsScroll.isVisible
+        }
     }
 
     private fun setupCameraSwitch() {
@@ -670,19 +803,47 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun setupTimerControl() {
-        viewBinding.timerSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) { viewBinding.timerValueText.text = getString(R.string.timer_seconds, progress) }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-        })
+        viewBinding.timerDecreaseButton.setOnClickListener { adjustTimer(-1) }
+        viewBinding.timerIncreaseButton.setOnClickListener { adjustTimer(1) }
+        applyTimerValue(timerSeconds)
+    }
+
+    private fun adjustTimer(delta: Int) {
+        applyTimerValue(timerSeconds + delta)
+        viewBinding.timerDecreaseButton.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+    }
+
+    private fun applyTimerValue(seconds: Int) {
+        timerSeconds = seconds.coerceIn(0, TIMER_MAX_SECONDS)
+        viewBinding.timerValueText.text = getString(R.string.timer_seconds, timerSeconds)
+        val canDecrease = timerSeconds > 0
+        val canIncrease = timerSeconds < TIMER_MAX_SECONDS
+        viewBinding.timerDecreaseButton.isEnabled = canDecrease
+        viewBinding.timerDecreaseButton.alpha = if (canDecrease) 1.0f else 0.5f
+        viewBinding.timerIncreaseButton.isEnabled = canIncrease
+        viewBinding.timerIncreaseButton.alpha = if (canIncrease) 1.0f else 0.5f
     }
 
     private fun setupBurstControl() {
-        viewBinding.burstSeekBar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
-            override fun onProgressChanged(seekBar: SeekBar?, progress: Int, fromUser: Boolean) { viewBinding.burstValueText.text = (progress + 1).toString() }
-            override fun onStartTrackingTouch(seekBar: SeekBar?) {}
-            override fun onStopTrackingTouch(seekBar: SeekBar?) {}
-        })
+        viewBinding.burstDecreaseButton.setOnClickListener { adjustBurst(-1) }
+        viewBinding.burstIncreaseButton.setOnClickListener { adjustBurst(1) }
+        applyBurstValue(burstCount)
+    }
+
+    private fun adjustBurst(delta: Int) {
+        applyBurstValue(burstCount + delta)
+        viewBinding.burstDecreaseButton.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+    }
+
+    private fun applyBurstValue(count: Int) {
+        burstCount = count.coerceIn(1, BURST_MAX_COUNT)
+        viewBinding.burstValueText.text = burstCount.toString()
+        val canDecrease = burstCount > 1
+        val canIncrease = burstCount < BURST_MAX_COUNT
+        viewBinding.burstDecreaseButton.isEnabled = canDecrease
+        viewBinding.burstDecreaseButton.alpha = if (canDecrease) 1.0f else 0.5f
+        viewBinding.burstIncreaseButton.isEnabled = canIncrease
+        viewBinding.burstIncreaseButton.alpha = if (canIncrease) 1.0f else 0.5f
     }
 
     @SuppressLint("ClickableViewAccessibility")
@@ -698,6 +859,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun focusOnTouch(event: MotionEvent) {
+        // Manual focus owns the lens; a stray tap must not silently hand it back to AF.
+        if (viewBinding.manualModeSwitch.isChecked) return
         val device = cameraDevice ?: return
         val session = captureSession ?: return
         val builder = previewRequestBuilder ?: return
@@ -786,6 +949,8 @@ class MainActivity : AppCompatActivity() {
         private const val REQUEST_CODE_PERMISSIONS = 10
         private const val MAX_PREVIEW_WIDTH = 1920
         private const val MAX_PREVIEW_HEIGHT = 1080
+        private const val TIMER_MAX_SECONDS = 10
+        private const val BURST_MAX_COUNT = 10
         private val REQUIRED_PERMISSIONS = mutableListOf(Manifest.permission.CAMERA).apply {
             if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) add(Manifest.permission.POST_NOTIFICATIONS)
