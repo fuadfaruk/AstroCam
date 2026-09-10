@@ -260,6 +260,40 @@
                     android:textSize="20sp" />
             </LinearLayout>
 
+            <!-- Wheels are the default. The legacy sliders stay reachable as an
+                 accessibility escape hatch; both bind to the same controller, so
+                 switching styles never loses the current selection. -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:layout_marginTop="14dp"
+                android:gravity="center_vertical"
+                android:orientation="horizontal">
+
+                <TextView
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Manual controls: "
+                    android:textColor="@color/control_on_surface_variant"
+                    android:textSize="13sp" />
+
+                <View
+                    android:layout_width="0dp"
+                    android:layout_height="1dp"
+                    android:layout_weight="1" />
+
+                <androidx.appcompat.widget.SwitchCompat
+                    android:id="@+id/classicSlidersSwitch"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:contentDescription="Use classic sliders instead of wheels"
+                    android:text="Classic sliders"
+                    android:textColor="@android:color/white"
+                    android:textSize="13sp"
+                    app:thumbTint="@color/switch_thumb_color"
+                    app:trackTint="@color/switch_track_color" />
+            </LinearLayout>
+
             <LinearLayout
                 android:layout_width="match_parent"
                 android:layout_height="wrap_content"
@@ -284,14 +318,26 @@
             </LinearLayout>
 
             <!-- Shutter indexes the stop table, so each step is exactly one speed. -->
-            <com.google.android.material.slider.Slider
-                android:id="@+id/shutterSlider"
-                style="@style/Widget.AstroCam.Slider"
+            <FrameLayout
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                app:labelBehavior="floating"
-                app:tickVisible="true" />
+                android:layout_height="wrap_content">
+
+                <com.cusapps.astrocam.controls.DiscreteWheelView
+                    android:id="@+id/shutterWheel"
+                    android:layout_width="match_parent"
+                    android:layout_height="64dp"
+                    android:layout_marginTop="2dp" />
+
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/shutterSlider"
+                    style="@style/Widget.AstroCam.Slider"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:visibility="gone"
+                    app:labelBehavior="floating"
+                    app:tickVisible="true" />
+            </FrameLayout>
 
             <LinearLayout
                 android:layout_width="match_parent"
@@ -317,14 +363,26 @@
             </LinearLayout>
 
             <!-- ISO indexes the one-third-stop table instead of every integer. -->
-            <com.google.android.material.slider.Slider
-                android:id="@+id/isoSlider"
-                style="@style/Widget.AstroCam.Slider"
+            <FrameLayout
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                app:labelBehavior="floating"
-                app:tickVisible="true" />
+                android:layout_height="wrap_content">
+
+                <com.cusapps.astrocam.controls.DiscreteWheelView
+                    android:id="@+id/isoWheel"
+                    android:layout_width="match_parent"
+                    android:layout_height="64dp"
+                    android:layout_marginTop="2dp" />
+
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/isoSlider"
+                    style="@style/Widget.AstroCam.Slider"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:visibility="gone"
+                    app:labelBehavior="floating"
+                    app:tickVisible="true" />
+            </FrameLayout>
 
             <LinearLayout
                 android:layout_width="match_parent"
@@ -355,6 +413,24 @@
                     android:layout_height="1dp"
                     android:layout_weight="1" />
 
+                <!-- Coarse/fine gain is exposed explicitly. The wheel also drops to fine
+                     gain automatically for short, deliberate drags. -->
+                <TextView
+                    android:id="@+id/focusFineModeButton"
+                    android:layout_width="wrap_content"
+                    android:layout_height="44dp"
+                    android:background="@drawable/bg_stepper_button"
+                    android:clickable="true"
+                    android:contentDescription="Toggle fine focus adjustment"
+                    android:focusable="true"
+                    android:gravity="center"
+                    android:minWidth="52dp"
+                    android:paddingStart="12dp"
+                    android:paddingEnd="12dp"
+                    android:text="Fine"
+                    android:textColor="@android:color/white"
+                    android:textSize="13sp" />
+
                 <!-- Infinity is a single tap rather than the last 1% of a track. -->
                 <TextView
                     android:id="@+id/focusInfinityButton"
@@ -373,49 +449,29 @@
                     android:textSize="18sp" />
             </LinearLayout>
 
-            <!-- Focus uses a fine 0..1000 scale; ticks would be unreadable at that density. -->
-            <com.google.android.material.slider.Slider
-                android:id="@+id/focusSlider"
-                style="@style/Widget.AstroCam.Slider"
+            <!-- Focus uses a fine 0..1000 scale. The wheel decouples gain from that
+                 density instead of squeezing every step onto one track, and its top
+                 end is a hard infinity detent rather than the last 1% of a slider. -->
+            <FrameLayout
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                app:labelBehavior="floating"
-                app:tickVisible="false" />
+                android:layout_height="wrap_content">
 
-            <LinearLayout
-                android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:gravity="end"
-                android:orientation="horizontal">
+                <com.cusapps.astrocam.controls.FocusWheelView
+                    android:id="@+id/focusWheel"
+                    android:layout_width="match_parent"
+                    android:layout_height="72dp"
+                    android:layout_marginTop="2dp" />
 
-                <TextView
-                    android:id="@+id/focusDecreaseButton"
-                    android:layout_width="44dp"
-                    android:layout_height="44dp"
-                    android:background="@drawable/bg_stepper_button"
-                    android:clickable="true"
-                    android:contentDescription="Nudge focus closer"
-                    android:focusable="true"
-                    android:gravity="center"
-                    android:text="−"
-                    android:textColor="@android:color/white"
-                    android:textSize="20sp" />
-
-                <TextView
-                    android:id="@+id/focusIncreaseButton"
-                    android:layout_width="44dp"
-                    android:layout_height="44dp"
-                    android:layout_marginStart="8dp"
-                    android:background="@drawable/bg_stepper_button"
-                    android:clickable="true"
-                    android:contentDescription="Nudge focus toward infinity"
-                    android:focusable="true"
-                    android:gravity="center"
-                    android:text="+"
-                    android:textColor="@android:color/white"
-                    android:textSize="20sp" />
-            </LinearLayout>
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/focusSlider"
+                    style="@style/Widget.AstroCam.Slider"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:visibility="gone"
+                    app:labelBehavior="floating"
+                    app:tickVisible="false" />
+            </FrameLayout>
 
             <LinearLayout
                 android:layout_width="match_parent"
@@ -458,15 +514,28 @@
             </LinearLayout>
 
             <!-- White balance is already quantized to 81 x 100K steps. -->
-            <com.google.android.material.slider.Slider
-                android:id="@+id/whiteBalanceSlider"
-                style="@style/Widget.AstroCam.Slider"
+            <FrameLayout
                 android:layout_width="match_parent"
-                android:layout_height="wrap_content"
-                android:layout_marginTop="2dp"
-                android:enabled="false"
-                app:labelBehavior="floating"
-                app:tickVisible="true" />
+                android:layout_height="wrap_content">
+
+                <com.cusapps.astrocam.controls.DiscreteWheelView
+                    android:id="@+id/whiteBalanceWheel"
+                    android:layout_width="match_parent"
+                    android:layout_height="64dp"
+                    android:layout_marginTop="2dp"
+                    android:enabled="false" />
+
+                <com.google.android.material.slider.Slider
+                    android:id="@+id/whiteBalanceSlider"
+                    style="@style/Widget.AstroCam.Slider"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="2dp"
+                    android:enabled="false"
+                    android:visibility="gone"
+                    app:labelBehavior="floating"
+                    app:tickVisible="true" />
+            </FrameLayout>
         </LinearLayout>
     </ScrollView>
 

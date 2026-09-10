@@ -6,7 +6,7 @@ A feature-packed, manual-control Android camera application built specifically f
 
 - **Long Exposure & Astrophotography Support:** Take full control over shutter speed, ISO, and focus distance to capture stars, nightscapes, and low-light environments.
 - **RAW (DNG) Capture Support:** Save uncompressed RAW image data alongside standard JPEGs for advanced post-processing and editing.
-- **Manual Controls:** Fine-tune ISO, exposure time (shutter speed), and manual focus with intuitive on-screen sliders.
+- **Manual Controls:** Fine-tune ISO, exposure time (shutter speed), focus, and white balance with detented horizontal wheels that give per-step haptic feedback for dark-adapted use. A classic-slider mode remains available as a fallback.
 - **Tap-to-Focus & Metering:** Easily tap anywhere on the viewfinder to focus and adjust metering.
 - **Timer & Burst Mode:** Customizable capture countdown timers and automated burst shooting modes.
 - **Background & Foreground Services:** Persistent camera service integration supporting background operation and media button triggers (wired/Bluetooth shutter remotes).
@@ -27,6 +27,7 @@ A feature-packed, manual-control Android camera application built specifically f
 app/src/main/java/com/cusapps/astrocam/
 ├── CameraService.kt       # Foreground service & background capture handling
 ├── CameraUtils.kt         # Camera helper functions & calculations
+├── controls/              # Wheel domains, manual-control state & custom wheel views
 ├── MainActivity.kt        # Primary UI & Camera2 orchestration controller
 ├── PhotoCaptureHelper.kt  # JPEG & RAW DNG image capture logic
 ├── StorageUtils.kt        # File saving & MediaStore integration
