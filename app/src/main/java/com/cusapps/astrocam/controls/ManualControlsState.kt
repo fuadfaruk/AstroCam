@@ -31,4 +31,19 @@ data class ManualControlsState(
         CameraUtils.calculateFocusDistance(focusProgress, minFocusDistance)
 
     fun whiteBalanceTemperature(): Int = CameraUtils.calculateColorTemperature(wbProgress)
+
+    /** Keeps selected values when camera ranges refresh; unknown ranges use startup defaults. */
+    fun withCameraDomains(
+        previousIsoStops: IntArray,
+        previousShutterSpeeds: LongArray,
+        isoStops: IntArray,
+        shutterSpeeds: LongArray,
+    ): ManualControlsState = copy(
+        isoIndex = CameraUtils.indexOfNearest(isoStops, iso(previousIsoStops)),
+        shutterIndex = CameraUtils.indexOfNearest(
+            shutterSpeeds,
+            previousShutterSpeeds.getOrNull(shutterIndex) ?: 16_666_666L
+        ),
+        focusProgress = focusProgress.coerceIn(0, CameraUtils.FOCUS_PROGRESS_MAX)
+    )
 }

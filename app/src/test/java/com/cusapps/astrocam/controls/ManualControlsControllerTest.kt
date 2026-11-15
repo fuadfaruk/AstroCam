@@ -88,6 +88,84 @@ class ManualControlsControllerTest {
     }
 
     @Test
+    fun `first camera setup selects the nearest startup defaults`() {
+        val state = ManualControlsState()
+
+        val configured = state.withCameraDomains(
+            intArrayOf(), longArrayOf(),
+            intArrayOf(100, 300, 800),
+            longArrayOf(1_000_000L, 20_000_000L, 1_000_000_000L)
+        )
+
+        assertEquals(state.copy(isoIndex = 1, shutterIndex = 1), configured)
+    }
+
+    @Test
+    fun `reopening the same camera preserves manual selections without committing`() {
+        val selected = ManualControlsState(
+            manualEnabled = true,
+            isoIndex = 3,
+            shutterIndex = 2,
+            focusProgress = 725,
+            wbProgress = CameraUtils.calculateTemperatureProgress(5000),
+            wbLocked = true,
+            wbSetByUser = true
+        )
+        val isoStops = intArrayOf(100, 400, 800, 1600)
+        val shutterSpeeds = longArrayOf(1_000_000L, 16_666_666L, 2_000_000_000L)
+        val controller = ManualControlsController(selected)
+        var commits = 0
+        controller.onCommit = { commits++ }
+
+        repeat(3) {
+            controller.scrub {
+                it.withCameraDomains(isoStops, shutterSpeeds, isoStops, shutterSpeeds)
+            }
+            assertEquals(selected, controller.state)
+        }
+
+        assertEquals(1600, controller.state.iso(isoStops))
+        assertEquals(2_000_000_000L, controller.state.shutterSpeed(shutterSpeeds))
+        assertEquals(2.75f, controller.state.focusDistance(10f), 0.001f)
+        assertEquals(0, commits)
+    }
+
+    @Test
+    fun `refreshed camera domains restore nearest values rather than old indices`() {
+        val selected = ManualControlsState(isoIndex = 1, shutterIndex = 1, focusProgress = 600)
+        val isoStops = intArrayOf(100, 200, 320, 800)
+        val shutterSpeeds = longArrayOf(1_000_000L, 16_666_666L, 50_000_000L, 125_000_000L)
+
+        val configured = selected.withCameraDomains(
+            intArrayOf(100, 400, 1600),
+            longArrayOf(1_000_000L, 100_000_000L, 2_000_000_000L),
+            isoStops, shutterSpeeds
+        )
+
+        assertEquals(selected.copy(isoIndex = 2, shutterIndex = 3), configured)
+        assertEquals(320, configured.iso(isoStops))
+        assertEquals(125_000_000L, configured.shutterSpeed(shutterSpeeds))
+    }
+
+    @Test
+    fun `refreshed camera domains clamp selections to supported endpoints`() {
+        val selected = ManualControlsState(isoIndex = 1, shutterIndex = 0, focusProgress = -20)
+        val previousIsoStops = intArrayOf(100, 3200)
+        val previousShutterSpeeds = longArrayOf(1_000_000L, 2_000_000_000L)
+        val isoStops = intArrayOf(100, 400, 800)
+        val shutterSpeeds = longArrayOf(16_666_666L, 100_000_000L, 1_000_000_000L)
+
+        val configured = selected.withCameraDomains(
+            previousIsoStops, previousShutterSpeeds, isoStops, shutterSpeeds
+        )
+
+        assertEquals(selected.copy(isoIndex = 2, shutterIndex = 0, focusProgress = 0), configured)
+        val beyondMaximum = selected.copy(focusProgress = CameraUtils.FOCUS_PROGRESS_MAX + 20)
+            .withCameraDomains(previousIsoStops, previousShutterSpeeds, isoStops, shutterSpeeds)
+        assertEquals(CameraUtils.FOCUS_PROGRESS_MAX, beyondMaximum.focusProgress)
+    }
+
+    @Test
     fun `callbacks are optional`() {
         val controller = ManualControlsController()
 

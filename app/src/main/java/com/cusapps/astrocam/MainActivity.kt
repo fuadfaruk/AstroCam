@@ -264,8 +264,8 @@ class MainActivity : AppCompatActivity() {
                 }, backgroundHandler)
             }
 
-            manager.openCamera(cameraId!!, stateCallback, backgroundHandler)
             updateManualControlsUI(characteristics)
+            manager.openCamera(cameraId!!, stateCallback, backgroundHandler)
         } catch (e: Exception) {
             Log.e(TAG, "Failed to open camera", e)
             cameraOpenCloseLock.release()
@@ -785,6 +785,12 @@ class MainActivity : AppCompatActivity() {
             isoRange?.upper ?: 3200
         )
         val computedMinFocus = characteristics.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 0f
+        val selectedState = controls.state.withCameraDomains(
+            previousIsoStops = isoStops,
+            previousShutterSpeeds = shutterSpeeds,
+            isoStops = computedIsoStops,
+            shutterSpeeds = computedShutterSpeeds
+        )
 
         // Explicit colour gains need AWB_MODE_OFF. Devices without it can still hold
         // colour steady through CONTROL_AWB_LOCK, just without a Kelvin dial.
@@ -802,13 +808,9 @@ class MainActivity : AppCompatActivity() {
         // focus controls are disabled rather than left looking functional.
         focusAvailable = computedMinFocus > 0f
 
-        val defaultShutterIndex = CameraUtils.indexOfNearest(computedShutterSpeeds, 16_666_666L)
-        val defaultIsoIndex = CameraUtils.indexOfNearest(computedIsoStops, CameraUtils.DEFAULT_ISO)
-
         runOnUiThread {
-            // A camera switch can change every domain, so re-point both presentations and
-            // re-seed the controller indices into the new ranges. Manual mode starts
-            // disabled; this only stages the controls for when it is switched on.
+            // Refresh both presentations without replacing the user's selections. A
+            // camera switch maps ISO and shutter to the nearest supported values.
             viewBinding.shutterWheel.setDomain(computedShutterSpeeds.size) { index ->
                 CameraUtils.formatShutterSpeed(
                     computedShutterSpeeds.getOrElse(index) { computedShutterSpeeds.last() }
@@ -822,17 +824,17 @@ class MainActivity : AppCompatActivity() {
             configureSlider(
                 viewBinding.shutterSlider,
                 computedShutterSpeeds.size,
-                defaultShutterIndex
+                selectedState.shutterIndex
             )
             configureSlider(
                 viewBinding.isoSlider,
                 computedIsoStops.size,
-                defaultIsoIndex
+                selectedState.isoIndex
             )
             configureSlider(
                 viewBinding.focusSlider,
                 CameraUtils.FOCUS_PROGRESS_MAX + 1,
-                CameraUtils.FOCUS_PROGRESS_MAX
+                selectedState.focusProgress
             )
 
             // White balance is not reconfigured here: its range is a constant, and
@@ -847,9 +849,9 @@ class MainActivity : AppCompatActivity() {
 
             controls.scrub {
                 it.copy(
-                    shutterIndex = defaultShutterIndex,
-                    isoIndex = defaultIsoIndex,
-                    focusProgress = CameraUtils.FOCUS_PROGRESS_MAX
+                    shutterIndex = selectedState.shutterIndex,
+                    isoIndex = selectedState.isoIndex,
+                    focusProgress = selectedState.focusProgress
                 )
             }
 
