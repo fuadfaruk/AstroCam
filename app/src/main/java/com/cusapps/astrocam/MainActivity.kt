@@ -47,12 +47,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
 
     private var cameraId: String? = null
-    private var cameraDevice: CameraDevice? = null
-    private var captureSession: CameraCaptureSession? = null
+    @Volatile private var cameraDevice: CameraDevice? = null
+    @Volatile private var captureSession: CameraCaptureSession? = null
     private var previewRequestBuilder: CaptureRequest.Builder? = null
     private var previewRequest: CaptureRequest? = null
     
-    private var imageReader: ImageReader? = null
+    @Volatile private var imageReader: ImageReader? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
     private val cameraOpenCloseLock = Semaphore(1)
@@ -91,6 +91,10 @@ class MainActivity : AppCompatActivity() {
     // Stepper-backed values, replacing the old timer/burst sliders.
     private var timerSeconds = 0
     private var burstCount = 1
+    private val captureSequence = CaptureSequence()
+    private val captureHandler = Handler(Looper.getMainLooper())
+    private var photoTimer: CountDownTimer? = null
+    private var burstRunnable: Runnable? = null
 
     // Manual control state lives here rather than in the widgets. The camera background
     // thread reads it through applyCurrentSettingsToPreview(), and reading a View from
@@ -126,6 +130,7 @@ class MainActivity : AppCompatActivity() {
         shutterSound.load(MediaActionSound.SHUTTER_CLICK)
 
         viewBinding.imageCaptureButton.setOnClickListener { startPhotoTimer() }
+        viewBinding.cancelCaptureButton.setOnClickListener { cancelCapture() }
         viewBinding.rawModeSwitch.setOnCheckedChangeListener { _, _ -> 
             closeCamera()
             openCamera(viewBinding.viewFinder.width, viewBinding.viewFinder.height)
@@ -165,13 +170,17 @@ class MainActivity : AppCompatActivity() {
             cameraOpenCloseLock.release()
             camera.close()
             cameraDevice = null
+            captureHandler.post { if (cameraDevice == null) closeCamera() }
         }
 
         override fun onError(camera: CameraDevice, error: Int) {
             cameraOpenCloseLock.release()
             camera.close()
             cameraDevice = null
-            finish()
+            captureHandler.post {
+                closeCamera()
+                finish()
+            }
         }
     }
 
@@ -305,10 +314,13 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun createCameraPreviewSession() {
+        val device = cameraDevice ?: return
+        val reader = imageReader ?: return
+        val cid = cameraId ?: return
         try {
             val texture = viewBinding.viewFinder.surfaceTexture!!
             val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-            val characteristics = manager.getCameraCharacteristics(cameraId!!)
+            val characteristics = manager.getCameraCharacteristics(cid)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
 
             // Choose the preview size relative to the sensor coordinate system,
@@ -364,12 +376,15 @@ class MainActivity : AppCompatActivity() {
             texture.setDefaultBufferSize(chosenPreviewSize.width, chosenPreviewSize.height)
             val surface = Surface(texture)
 
-            previewRequestBuilder = cameraDevice!!.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            previewRequestBuilder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
             previewRequestBuilder!!.addTarget(surface)
 
-            cameraDevice!!.createCaptureSession(listOf(surface, imageReader?.surface), object : CameraCaptureSession.StateCallback() {
+            device.createCaptureSession(listOf(surface, reader.surface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
-                    if (cameraDevice == null) return
+                    if (device !== cameraDevice) {
+                        session.close()
+                        return
+                    }
                     captureSession = session
                     try {
                         applyCurrentSettingsToPreview()
@@ -399,6 +414,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun closeCamera() {
+        cancelCapture()
         try {
             cameraOpenCloseLock.acquire()
             captureSession?.close()
@@ -408,6 +424,8 @@ class MainActivity : AppCompatActivity() {
             imageReader?.close()
             imageReader = null
             latestAwbGains = null
+            captureSequence.reset()
+            updateCaptureUi()
         } catch (e: InterruptedException) {
             throw RuntimeException("Interrupted while trying to lock camera closing.", e)
         } finally {
@@ -442,12 +460,35 @@ class MainActivity : AppCompatActivity() {
         mediaSession?.isActive = true
     }
 
-    private fun takePhoto(onComplete: (Boolean) -> Unit = {}) {
-        val device = cameraDevice ?: return
-        val session = captureSession ?: return
-        val reader = imageReader ?: return
+    private fun takePhoto(onComplete: (Boolean) -> Unit) {
+        val device = cameraDevice
+        val session = captureSession
+        val reader = imageReader
+        val cid = cameraId
+        if (device == null || session == null || reader == null || cid == null) {
+            onComplete(false)
+            return
+        }
+
+        var completionDelivered = false
+        fun finishCapture(success: Boolean) {
+            captureHandler.post {
+                if (completionDelivered) return@post
+                completionDelivered = true
+                if (session === captureSession) {
+                    try {
+                        applyCurrentSettingsToPreview()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to resume preview", e)
+                    }
+                }
+                onComplete(success)
+            }
+        }
 
         try {
+            val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val characteristics = manager.getCameraCharacteristics(cid)
             val captureBuilder = PhotoCaptureHelper.createCaptureRequest(
                 device, 
                 listOf(reader.surface),
@@ -463,63 +504,105 @@ class MainActivity : AppCompatActivity() {
             shutterSound.play(MediaActionSound.SHUTTER_CLICK)
             session.stopRepeating()
             session.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                private var captureSucceeded = false
+
                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)!!
-                    val image = capturedImages.remove(timestamp)
-                    if (image != null) {
-                        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-                        val characteristics = manager.getCameraCharacteristics(cameraId!!)
-                        processImage(image, result, characteristics)
-                    } else {
-                        captureResults[timestamp] = result
+                    if (session !== captureSession) return
+                    try {
+                        val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+                        val image = capturedImages.remove(timestamp)
+                        if (image != null) {
+                            processImage(image, result, characteristics)
+                        } else {
+                            captureResults[timestamp] = result
+                        }
+                        captureSucceeded = true
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to process capture result", e)
                     }
-                    applyCurrentSettingsToPreview()
-                    onComplete(true)
                 }
+
                 override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
-                    applyCurrentSettingsToPreview()
-                    onComplete(false)
+                    captureSucceeded = false
+                }
+
+                override fun onCaptureSequenceCompleted(session: CameraCaptureSession, sequenceId: Int, frameNumber: Long) {
+                    finishCapture(captureSucceeded)
+                }
+
+                override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+                    finishCapture(false)
                 }
             }, backgroundHandler)
-        } catch (e: CameraAccessException) {
+        } catch (e: Exception) {
             Log.e(TAG, "Capture failed", e)
-            onComplete(false)
+            finishCapture(false)
         }
     }
 
     private fun startPhotoTimer() {
+        if (cameraDevice == null || captureSession == null || imageReader == null) return
+        val captureId = captureSequence.start(burstCount) ?: return
+        updateCaptureUi()
         if (timerSeconds == 0) {
-            takeBurstPhotos()
+            takeBurstPhotos(captureId)
             return
         }
 
         viewBinding.timerText.isVisible = true
-        object : CountDownTimer((timerSeconds * 1000).toLong(), 1000) {
+        photoTimer = object : CountDownTimer(timerSeconds * 1000L, 1000) {
             override fun onTick(millisUntilFinished: Long) {
+                if (!captureSequence.isActive(captureId)) return
                 viewBinding.timerText.text = ((millisUntilFinished / 1000) + 1).toString()
             }
             override fun onFinish() {
+                if (!captureSequence.isActive(captureId)) return
+                photoTimer = null
                 viewBinding.timerText.isVisible = false
-                takeBurstPhotos()
+                takeBurstPhotos(captureId)
             }
         }.start()
     }
 
-    private fun takeBurstPhotos() {
-        var capturedCount = 0
-        fun captureNext() {
-            if (capturedCount < burstCount) {
+    private fun takeBurstPhotos(captureId: Long) {
+        val captureNext = object : Runnable {
+            override fun run() {
+                if (!captureSequence.beginFrame(captureId)) return
+                burstRunnable = null
                 takePhoto { success ->
-                    if (success) {
-                        capturedCount++
-                        if (capturedCount < burstCount) {
-                            Handler(Looper.getMainLooper()).postDelayed({ captureNext() }, 100)
-                        }
+                    val shouldContinue = captureSequence.completeFrame(captureId, success)
+                    updateCaptureUi()
+                    if (shouldContinue) {
+                        burstRunnable = this
+                        captureHandler.postDelayed(this, 100)
                     }
                 }
             }
         }
-        captureNext()
+        captureNext.run()
+    }
+
+    private fun cancelCapture() {
+        photoTimer?.cancel()
+        photoTimer = null
+        burstRunnable?.let { captureHandler.removeCallbacks(it) }
+        burstRunnable = null
+        captureSequence.cancel()
+        viewBinding.timerText.isVisible = false
+        updateCaptureUi()
+    }
+
+    private fun updateCaptureUi() {
+        val capturing = captureSequence.isCaptureInProgress
+        val cancelling = captureSequence.isCancellationRequested
+        viewBinding.imageCaptureButton.isEnabled = !capturing
+        viewBinding.imageCaptureButton.alpha = if (capturing) 0.5f else 1.0f
+        viewBinding.cancelCaptureButton.isVisible = capturing
+        viewBinding.cancelCaptureButton.isEnabled = !cancelling
+        viewBinding.cancelCaptureButton.alpha = if (cancelling) 0.5f else 1.0f
+        viewBinding.cancelCaptureButton.setText(
+            if (cancelling) R.string.capture_stopping else R.string.cancel_capture
+        )
     }
 
     private fun flashScreen() {
@@ -1029,13 +1112,20 @@ class MainActivity : AppCompatActivity() {
             setCallback(object : MediaSessionCompat.Callback() {
                 override fun onMediaButtonEvent(mediaButtonEvent: Intent?): Boolean {
                     val keyEvent = mediaButtonEvent?.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
-                    if (keyEvent?.action == KeyEvent.ACTION_DOWN) { startPhotoTimer(); return true }
+                    if (keyEvent?.action == KeyEvent.ACTION_DOWN) {
+                        if (keyEvent.repeatCount == 0) {
+                            if (keyEvent.keyCode == KeyEvent.KEYCODE_MEDIA_STOP) cancelCapture()
+                            else startPhotoTimer()
+                        }
+                        return true
+                    }
                     return super.onMediaButtonEvent(mediaButtonEvent)
                 }
                 override fun onPlay() = startPhotoTimer()
                 override fun onPause() = startPhotoTimer()
-            })
-            setPlaybackState(PlaybackStateCompat.Builder().setActions(PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE).setState(PlaybackStateCompat.STATE_PLAYING, 0, 1.0f).build())
+                override fun onStop() = cancelCapture()
+            }, captureHandler)
+            setPlaybackState(PlaybackStateCompat.Builder().setActions(PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE or PlaybackStateCompat.ACTION_STOP).setState(PlaybackStateCompat.STATE_PLAYING, 0, 1.0f).build())
             isActive = true
         }
     }
@@ -1043,14 +1133,19 @@ class MainActivity : AppCompatActivity() {
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
 
     override fun onDestroy() {
+        cancelCapture()
         super.onDestroy()
         mediaSession?.release()
+        captureHandler.removeCallbacksAndMessages(null)
         shutterSound.release()
     }
 
     override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
         return when (keyCode) {
-            KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN -> { startPhotoTimer(); true }
+            KeyEvent.KEYCODE_VOLUME_UP, KeyEvent.KEYCODE_VOLUME_DOWN -> {
+                if (event?.repeatCount == 0) startPhotoTimer()
+                true
+            }
             else -> super.onKeyDown(keyCode, event)
         }
     }

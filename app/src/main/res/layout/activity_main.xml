@@ -553,4 +553,23 @@
         app:layout_constraintStart_toStartOf="parent"
         app:layout_constraintEnd_toEndOf="parent" />
 
+    <TextView
+        android:id="@+id/cancelCaptureButton"
+        android:layout_width="72dp"
+        android:layout_height="48dp"
+        android:layout_marginStart="12dp"
+        android:background="@drawable/bg_icon_button"
+        android:clickable="true"
+        android:contentDescription="@string/cancel_capture_description"
+        android:elevation="6dp"
+        android:focusable="true"
+        android:gravity="center"
+        android:text="@string/cancel_capture"
+        android:textColor="@android:color/white"
+        android:textSize="13sp"
+        android:visibility="gone"
+        app:layout_constraintBottom_toBottomOf="@id/imageCaptureButton"
+        app:layout_constraintStart_toEndOf="@id/imageCaptureButton"
+        app:layout_constraintTop_toTopOf="@id/imageCaptureButton" />
+
 </androidx.constraintlayout.widget.ConstraintLayout>

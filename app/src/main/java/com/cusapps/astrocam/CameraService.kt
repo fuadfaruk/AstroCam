@@ -4,6 +4,7 @@ import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
@@ -48,12 +49,21 @@ class CameraService : Service() {
     
     private var currentCameraId: String? = null
     
-    private var cameraDevice: CameraDevice? = null
-    private var captureSession: CameraCaptureSession? = null
-    private var imageReader: ImageReader? = null
+    @Volatile private var cameraDevice: CameraDevice? = null
+    @Volatile private var captureSession: CameraCaptureSession? = null
+    @Volatile private var imageReader: ImageReader? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
     private val cameraOpenCloseLock = Semaphore(1)
+    private val captureSequence = CaptureSequence()
+    private val mainHandler = Handler(Looper.getMainLooper())
+    private var isStopping = false
+    private val notificationReset = Runnable {
+        updateNotification(
+            if (captureSession == null) "Camera not ready."
+            else "Ready to capture even when screen is off"
+        )
+    }
 
     // Maps to link images with their capture results for RAW DNG creation
     private val captureResults = mutableMapOf<Long, TotalCaptureResult>()
@@ -65,6 +75,7 @@ class CameraService : Service() {
         private const val NOTIFICATION_ID = 1
         
         const val ACTION_UPDATE_SETTINGS = "com.cusapps.astrocam.UPDATE_SETTINGS"
+        const val ACTION_CANCEL_CAPTURE = "com.cusapps.astrocam.CANCEL_CAPTURE"
         const val EXTRA_MANUAL_MODE = "extra_manual_mode"
         const val EXTRA_RAW_MODE = "extra_raw_mode"
         const val EXTRA_ISO = "extra_iso"
@@ -116,6 +127,12 @@ class CameraService : Service() {
 
     @RequiresPermission(Manifest.permission.CAMERA)
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (intent?.action == ACTION_CANCEL_CAPTURE) {
+            // A stale notification action can start a new, uninitialized service.
+            if (currentCameraId == null) stopSelfResult(startId)
+            else cancelCapture()
+            return START_NOT_STICKY
+        }
         if (intent?.action == ACTION_UPDATE_SETTINGS) {
             manualMode = intent.getBooleanExtra(EXTRA_MANUAL_MODE, false)
             rawMode = intent.getBooleanExtra(EXTRA_RAW_MODE, false)
@@ -189,11 +206,13 @@ class CameraService : Service() {
                     cameraOpenCloseLock.release()
                     camera.close()
                     cameraDevice = null
+                    mainHandler.post { if (cameraDevice == null) closeCamera() }
                 }
                 override fun onError(camera: CameraDevice, error: Int) {
                     cameraOpenCloseLock.release()
                     camera.close()
                     cameraDevice = null
+                    mainHandler.post { if (cameraDevice == null) closeCamera() }
                 }
             }, backgroundHandler)
         } catch (e: Exception) {
@@ -217,7 +236,17 @@ class CameraService : Service() {
         try {
             device.createCaptureSession(listOf(reader.surface), object : CameraCaptureSession.StateCallback() {
                 override fun onConfigured(session: CameraCaptureSession) {
+                    if (device !== cameraDevice) {
+                        session.close()
+                        return
+                    }
                     captureSession = session
+                    mainHandler.post {
+                        if (captureSession === session && !captureSequence.isCaptureInProgress) {
+                            mainHandler.removeCallbacks(notificationReset)
+                            updateNotification("Ready to capture even when screen is off")
+                        }
+                    }
                 }
                 override fun onConfigureFailed(session: CameraCaptureSession) {
                     Log.e(TAG, "Failed to configure capture session")
@@ -229,6 +258,8 @@ class CameraService : Service() {
     }
 
     private fun closeCamera() {
+        captureSequence.cancel()
+        mainHandler.removeCallbacks(notificationReset)
         try {
             cameraOpenCloseLock.acquire()
             captureSession?.close()
@@ -240,6 +271,9 @@ class CameraService : Service() {
             captureResults.clear()
             capturedImages.values.forEach { it.close() }
             capturedImages.clear()
+            captureSequence.reset()
+            if (wakeLock?.isHeld == true) wakeLock?.release()
+            updateNotification("Camera not ready.")
         } catch (e: InterruptedException) {
             Log.e(TAG, "Interrupted while closing camera", e)
         } finally {
@@ -253,16 +287,20 @@ class CameraService : Service() {
                 override fun onMediaButtonEvent(mediaButtonEvent: Intent?): Boolean {
                     val keyEvent = mediaButtonEvent?.getParcelableExtra<KeyEvent>(Intent.EXTRA_KEY_EVENT)
                     if (keyEvent?.action == KeyEvent.ACTION_DOWN) {
-                        takePhoto()
+                        if (keyEvent.repeatCount == 0) {
+                            if (keyEvent.keyCode == KeyEvent.KEYCODE_MEDIA_STOP) cancelCapture()
+                            else takePhoto()
+                        }
                         return true
                     }
                     return super.onMediaButtonEvent(mediaButtonEvent)
                 }
                 override fun onPlay() = takePhoto()
                 override fun onPause() = takePhoto()
-            })
+                override fun onStop() = cancelCapture()
+            }, mainHandler)
             setPlaybackState(PlaybackStateCompat.Builder()
-                .setActions(PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE)
+                .setActions(PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE or PlaybackStateCompat.ACTION_STOP)
                 .setState(PlaybackStateCompat.STATE_PLAYING, 0, 1.0f)
                 .build())
             isActive = true
@@ -270,74 +308,107 @@ class CameraService : Service() {
     }
 
     private fun takePhoto() {
+        val captureId = captureSequence.start(1) ?: return
+        captureSequence.beginFrame(captureId)
+        mainHandler.removeCallbacks(notificationReset)
         wakeLock?.acquire(10 * 60 * 1000L)
         Log.d(TAG, "Taking photo in background.")
         
-        notificationBuilder?.setContentText("Capturing image...")
-        notificationManager?.notify(NOTIFICATION_ID, notificationBuilder?.build())
+        updateNotification("Capturing image...")
         
-        capturePhoto()
+        capturePhoto(captureId)
     }
 
-    private fun capturePhoto() {
-        val device = cameraDevice ?: run {
-            resetNotification("Camera not ready.")
-            if (wakeLock?.isHeld == true) wakeLock?.release()
+    private fun capturePhoto(captureId: Long) {
+        val device = cameraDevice
+        val session = captureSession
+        val reader = imageReader
+        val cid = currentCameraId
+        if (device == null || session == null || reader == null || cid == null) {
+            finishCapture(captureId, false, "Camera not ready.")
             return
         }
-        val session = captureSession ?: run {
-            resetNotification("Session not ready.")
-            if (wakeLock?.isHeld == true) wakeLock?.release()
-            return
-        }
-        val reader = imageReader ?: return
 
         try {
+            val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
+            val characteristics = manager.getCameraCharacteristics(cid)
             val settings = PhotoCaptureHelper.CaptureSettings(manualMode, iso, shutterSpeed, focusDistance, whiteBalance)
             val captureBuilder = PhotoCaptureHelper.createCaptureRequest(device, listOf(reader.surface), settings)
 
             shutterSound.play(MediaActionSound.SHUTTER_CLICK)
             session.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
+                private var captureSucceeded = false
+
                 override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP)!!
-                    val image = capturedImages.remove(timestamp)
-                    if (image != null) {
-                        val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
-                        val characteristics = manager.getCameraCharacteristics(currentCameraId!!)
-                        processImage(image, result, characteristics)
-                    } else {
-                        captureResults[timestamp] = result
+                    if (session !== captureSession) return
+                    try {
+                        val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
+                        val image = capturedImages.remove(timestamp)
+                        if (image != null) {
+                            processImage(image, result, characteristics)
+                        } else {
+                            captureResults[timestamp] = result
+                        }
+                        captureSucceeded = true
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to process capture result", e)
                     }
-                    resetNotification("Photo saved.")
-                    if (wakeLock?.isHeld == true) wakeLock?.release()
                 }
+
                 override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
-                    resetNotification("Capture failed.")
-                    if (wakeLock?.isHeld == true) wakeLock?.release()
+                    captureSucceeded = false
+                }
+
+                override fun onCaptureSequenceCompleted(session: CameraCaptureSession, sequenceId: Int, frameNumber: Long) {
+                    mainHandler.post {
+                        finishCapture(captureId, captureSucceeded, if (captureSucceeded) "Photo saved." else "Capture failed.")
+                    }
+                }
+
+                override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
+                    mainHandler.post { finishCapture(captureId, false, "Capture aborted.") }
                 }
             }, backgroundHandler)
-        } catch (e: CameraAccessException) {
+        } catch (e: Exception) {
             Log.e(TAG, "Capture failed in background", e)
-            resetNotification("Capture failed: ${e.message}")
-            if (wakeLock?.isHeld == true) wakeLock?.release()
+            finishCapture(captureId, false, "Capture failed: ${e.message}")
         }
     }
 
-    private fun resetNotification(text: String) {
+    private fun finishCapture(captureId: Long, success: Boolean, text: String) {
+        if (!captureSequence.owns(captureId)) return
+        val cancelled = captureSequence.isCancellationRequested
+        captureSequence.completeFrame(captureId, success)
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        resetNotification(if (cancelled) "Capture stopped." else text)
+    }
+
+    private fun cancelCapture() {
+        if (!captureSequence.isCaptureInProgress || captureSequence.isCancellationRequested) return
+        captureSequence.cancel()
+        updateNotification("Stopping after current photo...")
+    }
+
+    private fun updateNotification(text: String) {
+        if (isStopping) return
         notificationBuilder?.setContentText(text)
         notificationManager?.notify(NOTIFICATION_ID, notificationBuilder?.build())
-        Handler(Looper.getMainLooper()).postDelayed({
-            notificationBuilder?.setContentText("Ready to capture even when screen is off")
-            notificationManager?.notify(NOTIFICATION_ID, notificationBuilder?.build())
-        }, 3000)
+    }
+
+    private fun resetNotification(text: String) {
+        mainHandler.removeCallbacks(notificationReset)
+        updateNotification(text)
+        mainHandler.postDelayed(notificationReset, 3000)
     }
 
     override fun onDestroy() {
+        isStopping = true
         super.onDestroy()
         closeCamera()
         stopBackgroundThread()
         if (wakeLock?.isHeld == true) wakeLock?.release()
         mediaSession?.release()
+        mainHandler.removeCallbacksAndMessages(null)
         shutterSound.release()
     }
 
@@ -356,11 +427,18 @@ class CameraService : Service() {
     }
 
     private fun createNotification(): Notification {
+        val cancelIntent = PendingIntent.getService(
+            this,
+            0,
+            Intent(this, CameraService::class.java).setAction(ACTION_CANCEL_CAPTURE),
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
         notificationBuilder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("AstroCam Background Mode")
-            .setContentText("Ready to capture even when screen is off")
+            .setContentText("Camera not ready.")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setPriority(NotificationCompat.PRIORITY_LOW)
+            .addAction(0, getString(R.string.cancel_capture), cancelIntent)
         return notificationBuilder!!.build()
     }
 }
