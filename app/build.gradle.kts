@@ -46,6 +46,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.service)
 
     testImplementation(libs.junit)
+    testImplementation(libs.robolectric)
     androidTestImplementation(libs.androidx.junit)
     androidTestImplementation(libs.androidx.espresso.core)
 }

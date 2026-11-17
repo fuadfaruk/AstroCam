@@ -11,7 +11,6 @@ import android.content.Intent
 import android.content.pm.ServiceInfo
 import android.graphics.ImageFormat
 import android.hardware.camera2.*
-import android.media.Image
 import android.media.ImageReader
 import android.media.MediaActionSound
 import android.os.*
@@ -65,9 +64,8 @@ class CameraService : Service() {
         )
     }
 
-    // Maps to link images with their capture results for RAW DNG creation
-    private val captureResults = mutableMapOf<Long, TotalCaptureResult>()
-    private val capturedImages = mutableMapOf<Long, Image>()
+    // Accessed only on the camera background handler.
+    private var pendingCapture: PhotoCaptureHelper.PendingCapture? = null
 
     companion object {
         private const val TAG = "CameraService"
@@ -182,16 +180,20 @@ class CameraService : Service() {
             val largest = Collections.max(map.getOutputSizes(format).toList(), CompareSizesByArea())
             
             imageReader = ImageReader.newInstance(largest.width, largest.height, format, 2).apply {
-                setOnImageAvailableListener({ reader ->
-                    backgroundHandler?.post {
-                        val image = try { reader.acquireNextImage() } catch (e: Exception) { null } ?: return@post
-                        val timestamp = image.timestamp
-                        val result = captureResults.remove(timestamp)
-                        if (result != null) {
-                            processImage(image, result, characteristics)
-                        } else {
-                            capturedImages[timestamp] = image
-                        }
+                setOnImageAvailableListener(listener@{ reader ->
+                    if (reader !== imageReader) return@listener
+                    val image = try {
+                        reader.acquireNextImage()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to acquire captured image", e)
+                        pendingCapture?.onImageAcquisitionFailed(e)
+                        null
+                    } ?: return@listener
+                    val pending = pendingCapture
+                    if (pending == null) {
+                        image.close()
+                    } else {
+                        pending.onImageAvailable(image)
                     }
                 }, backgroundHandler)
             }
@@ -219,15 +221,6 @@ class CameraService : Service() {
             Log.e(TAG, "Failed to open camera in service", e)
             cameraOpenCloseLock.release()
         }
-    }
-
-    private fun processImage(image: Image, result: TotalCaptureResult, characteristics: CameraCharacteristics) {
-        PhotoCaptureHelper.saveImage(this@CameraService, image, 
-            characteristics = characteristics,
-            captureResult = result,
-            onImageSaved = { Log.d(TAG, "Photo saved in background") },
-            onError = { e -> Log.e(TAG, "Error saving photo in background", e) }
-        )
     }
 
     private fun createCaptureSession() {
@@ -266,11 +259,15 @@ class CameraService : Service() {
             captureSession = null
             cameraDevice?.close()
             cameraDevice = null
-            imageReader?.close()
+            val reader = imageReader
             imageReader = null
-            captureResults.clear()
-            capturedImages.values.forEach { it.close() }
-            capturedImages.clear()
+            val cleanup = Runnable {
+                pendingCapture?.close()
+                pendingCapture = null
+                reader?.close()
+            }
+            val handler = backgroundHandler
+            if (handler == null) cleanup.run() else handler.post(cleanup)
             captureSequence.reset()
             if (wakeLock?.isHeld == true) wakeLock?.release()
             updateNotification("Camera not ready.")
@@ -324,7 +321,8 @@ class CameraService : Service() {
         val session = captureSession
         val reader = imageReader
         val cid = currentCameraId
-        if (device == null || session == null || reader == null || cid == null) {
+        val handler = backgroundHandler
+        if (device == null || session == null || reader == null || cid == null || handler == null) {
             finishCapture(captureId, false, "Camera not ready.")
             return
         }
@@ -335,40 +333,38 @@ class CameraService : Service() {
             val settings = PhotoCaptureHelper.CaptureSettings(manualMode, iso, shutterSpeed, focusDistance, whiteBalance)
             val captureBuilder = PhotoCaptureHelper.createCaptureRequest(device, listOf(reader.surface), settings)
 
-            shutterSound.play(MediaActionSound.SHUTTER_CLICK)
-            session.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
-                private var captureSucceeded = false
-
-                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    if (session !== captureSession) return
-                    try {
-                        val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
-                        val image = capturedImages.remove(timestamp)
-                        if (image != null) {
-                            processImage(image, result, characteristics)
-                        } else {
-                            captureResults[timestamp] = result
-                        }
-                        captureSucceeded = true
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to process capture result", e)
-                    }
-                }
-
-                override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
-                    captureSucceeded = false
-                }
-
-                override fun onCaptureSequenceCompleted(session: CameraCaptureSession, sequenceId: Int, frameNumber: Long) {
+            val pending = PhotoCaptureHelper.PendingCapture(this, characteristics, handler,
+                onCameraFinished = {
                     mainHandler.post {
-                        finishCapture(captureId, captureSucceeded, if (captureSucceeded) "Photo saved." else "Capture failed.")
+                        if (session === captureSession && captureSequence.isActive(captureId)) {
+                            updateNotification("Saving image...")
+                        }
                     }
                 }
-
-                override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
-                    mainHandler.post { finishCapture(captureId, false, "Capture aborted.") }
+            ) { error ->
+                mainHandler.post {
+                    if (session !== captureSession) return@post
+                    if (error != null) Log.e(TAG, "Capture or save failed in background", error)
+                    finishCapture(captureId, error == null,
+                        if (error == null) "Photo saved." else "Capture or save failed: ${error.message}")
                 }
-            }, backgroundHandler)
+            }
+            if (!handler.post {
+                if (session !== captureSession || reader !== imageReader) {
+                    pending.close()
+                    return@post
+                }
+                pendingCapture?.close()
+                pendingCapture = pending
+                try {
+                    shutterSound.play(MediaActionSound.SHUTTER_CLICK)
+                    session.capture(captureBuilder.build(), pending, handler)
+                } catch (e: Exception) {
+                    pending.abort(e)
+                }
+            }) {
+                finishCapture(captureId, false, "Camera handler is not running.")
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Capture failed in background", e)
             finishCapture(captureId, false, "Capture failed: ${e.message}")
@@ -380,7 +376,7 @@ class CameraService : Service() {
         val cancelled = captureSequence.isCancellationRequested
         captureSequence.completeFrame(captureId, success)
         if (wakeLock?.isHeld == true) wakeLock?.release()
-        resetNotification(if (cancelled) "Capture stopped." else text)
+        resetNotification(if (cancelled && success) "Capture stopped." else text)
     }
 
     private fun cancelCapture() {

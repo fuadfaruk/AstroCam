@@ -7,6 +7,7 @@ import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
 import java.io.File
+import java.io.IOException
 
 /**
  * StorageUtils handles the complexities of saving media files to the Android system gallery (MediaStore).
@@ -22,8 +23,11 @@ object StorageUtils {
      * @param context The application or activity context required to access the ContentResolver.
      * @param file The physical File object sitting in the app's internal or external storage.
      * @param mimeType The type of media (e.g., "image/jpeg").
+     * @return The published MediaStore Uri after writing and closing the output stream.
+     * @throws IOException If MediaStore cannot create, write, or publish the entry.
      */
-    fun addToMediaStore(context: Context, file: File, mimeType: String) {
+    @Throws(IOException::class)
+    fun addToMediaStore(context: Context, file: File, mimeType: String): Uri {
         // ContentValues is a name/value pair structure used to insert data into content providers.
         val values = ContentValues().apply {
             // The name of the file as it will appear to the user.
@@ -45,30 +49,40 @@ object StorageUtils {
         val collection = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
         
         // Insert the metadata into MediaStore and get back a Uri representing the new entry.
-        val uri = context.contentResolver.insert(collection, values)
+        val resolver = context.contentResolver
+        val uri = resolver.insert(collection, values)
+            ?: throw IOException("Failed to create MediaStore entry for ${file.name} in $collection.")
         
-        uri?.let { targetUri ->
-            try {
-                // Open an output stream to the MediaStore entry.
-                context.contentResolver.openOutputStream(targetUri)?.use { outputStream ->
-                    // Open an input stream from our physical file.
-                    file.inputStream().use { inputStream ->
-                        // Copy the bytes from the physical file to the MediaStore location.
-                        inputStream.copyTo(outputStream)
-                    }
+        try {
+            // Close both streams before making the entry public.
+            val outputStream = resolver.openOutputStream(uri)
+                ?: throw IOException("Failed to open MediaStore output stream for $uri.")
+            outputStream.use { output ->
+                file.inputStream().use { input ->
+                    input.copyTo(output)
                 }
-                
-                // After writing is done, we must clear the IS_PENDING flag for Android 10+.
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-                    values.clear()
-                    values.put(MediaStore.MediaColumns.IS_PENDING, 0)
-                    // Update the entry to notify the system that the file is now ready for public use.
-                    context.contentResolver.update(targetUri, values, null, null)
-                }
-                Log.d(TAG, "Successfully added $file to MediaStore.")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to write to MediaStore for URI: $targetUri", e)
             }
-        } ?: Log.e(TAG, "Failed to create new MediaStore entry.")
+
+            // After writing is done, we must clear the IS_PENDING flag for Android 10+.
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear()
+                values.put(MediaStore.MediaColumns.IS_PENDING, 0)
+                val updatedRows = resolver.update(uri, values, null, null)
+                if (updatedRows != 1) {
+                    throw IOException("Failed to publish MediaStore entry $uri: expected 1 updated row, got $updatedRows.")
+                }
+            }
+            Log.d(TAG, "Successfully added $file to MediaStore.")
+            return uri
+        } catch (failure: Throwable) {
+            try {
+                resolver.delete(uri, null, null)
+            } catch (cleanupFailure: Throwable) {
+                if (cleanupFailure !== failure) {
+                    failure.addSuppressed(cleanupFailure)
+                }
+            }
+            throw failure
+        }
     }
 }

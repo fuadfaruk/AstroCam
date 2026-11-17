@@ -12,7 +12,6 @@ import android.graphics.Point
 import android.graphics.SurfaceTexture
 import android.hardware.camera2.*
 import android.hardware.camera2.CameraMetadata
-import android.media.Image
 import android.media.ImageReader
 import android.media.MediaActionSound
 import android.os.*
@@ -69,9 +68,8 @@ class MainActivity : AppCompatActivity() {
     private val shutterSound = MediaActionSound()
     private var userMinimized = false
     
-    // Logic to match images with capture results for RAW DNG creation
-    private val captureResults = mutableMapOf<Long, TotalCaptureResult>()
-    private val capturedImages = mutableMapOf<Long, Image>()
+    // Accessed only on the camera background handler.
+    private var pendingCapture: PhotoCaptureHelper.PendingCapture? = null
 
     // White balance state. Written from the camera background handler, read from the
     // UI thread when the lock engages, hence @Volatile.
@@ -259,16 +257,20 @@ class MainActivity : AppCompatActivity() {
             val largest = Collections.max(map.getOutputSizes(outputFormat).toList(), CompareSizesByArea())
             
             imageReader = ImageReader.newInstance(largest.width, largest.height, outputFormat, 2).apply {
-                setOnImageAvailableListener({ reader ->
-                    backgroundHandler?.post {
-                        val image = reader.acquireNextImage()
-                        val timestamp = image.timestamp
-                        val result = captureResults.remove(timestamp)
-                        if (result != null) {
-                            processImage(image, result, characteristics)
-                        } else {
-                            capturedImages[timestamp] = image
-                        }
+                setOnImageAvailableListener(listener@{ reader ->
+                    if (reader !== imageReader) return@listener
+                    val image = try {
+                        reader.acquireNextImage()
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Failed to acquire captured image", e)
+                        pendingCapture?.onImageAcquisitionFailed(e)
+                        null
+                    } ?: return@listener
+                    val pending = pendingCapture
+                    if (pending == null) {
+                        image.close()
+                    } else {
+                        pending.onImageAvailable(image)
                     }
                 }, backgroundHandler)
             }
@@ -279,15 +281,6 @@ class MainActivity : AppCompatActivity() {
             Log.e(TAG, "Failed to open camera", e)
             cameraOpenCloseLock.release()
         }
-    }
-
-    private fun processImage(image: Image, result: TotalCaptureResult, characteristics: CameraCharacteristics) {
-        PhotoCaptureHelper.saveImage(this@MainActivity, image, 
-            characteristics = characteristics,
-            captureResult = result,
-            onImageSaved = { runOnUiThread { flashScreen() } },
-            onError = { e -> runOnUiThread { Toast.makeText(this@MainActivity, "Error: ${e.message}", Toast.LENGTH_SHORT).show() } }
-        )
     }
 
     private fun applyPreviewTransformForCurrentSize(previewSize: Size) {
@@ -421,8 +414,15 @@ class MainActivity : AppCompatActivity() {
             captureSession = null
             cameraDevice?.close()
             cameraDevice = null
-            imageReader?.close()
+            val reader = imageReader
             imageReader = null
+            val cleanup = Runnable {
+                pendingCapture?.close()
+                pendingCapture = null
+                reader?.close()
+            }
+            val handler = backgroundHandler
+            if (handler == null) cleanup.run() else handler.post(cleanup)
             latestAwbGains = null
             captureSequence.reset()
             updateCaptureUi()
@@ -465,24 +465,37 @@ class MainActivity : AppCompatActivity() {
         val session = captureSession
         val reader = imageReader
         val cid = cameraId
-        if (device == null || session == null || reader == null || cid == null) {
+        val handler = backgroundHandler
+        if (device == null || session == null || reader == null || cid == null || handler == null) {
             onComplete(false)
             return
         }
 
         var completionDelivered = false
-        fun finishCapture(success: Boolean) {
+        var previewResumed = false
+        fun resumePreview() {
+            if (previewResumed || session !== captureSession) return
+            previewResumed = true
+            try {
+                applyCurrentSettingsToPreview()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to resume preview", e)
+            }
+        }
+
+        fun finishCapture(error: Exception?) {
             captureHandler.post {
                 if (completionDelivered) return@post
                 completionDelivered = true
-                if (session === captureSession) {
-                    try {
-                        applyCurrentSettingsToPreview()
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to resume preview", e)
-                    }
+                if (session !== captureSession) return@post
+                resumePreview()
+                if (error == null) {
+                    flashScreen()
+                } else {
+                    Log.e(TAG, "Capture or save failed", error)
+                    Toast.makeText(this@MainActivity, "Error: ${error.message}", Toast.LENGTH_SHORT).show()
                 }
-                onComplete(success)
+                onComplete(error == null)
             }
         }
 
@@ -501,42 +514,30 @@ class MainActivity : AppCompatActivity() {
                 )
             )
 
-            shutterSound.play(MediaActionSound.SHUTTER_CLICK)
-            session.stopRepeating()
-            session.capture(captureBuilder.build(), object : CameraCaptureSession.CaptureCallback() {
-                private var captureSucceeded = false
-
-                override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
-                    if (session !== captureSession) return
-                    try {
-                        val timestamp = result.get(CaptureResult.SENSOR_TIMESTAMP) ?: return
-                        val image = capturedImages.remove(timestamp)
-                        if (image != null) {
-                            processImage(image, result, characteristics)
-                        } else {
-                            captureResults[timestamp] = result
-                        }
-                        captureSucceeded = true
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Failed to process capture result", e)
-                    }
+            val pending = PhotoCaptureHelper.PendingCapture(this, characteristics, handler,
+                onCameraFinished = { captureHandler.post { resumePreview() } },
+                onComplete = ::finishCapture
+            )
+            if (!handler.post {
+                if (session !== captureSession || reader !== imageReader) {
+                    pending.close()
+                    return@post
                 }
-
-                override fun onCaptureFailed(session: CameraCaptureSession, request: CaptureRequest, failure: CaptureFailure) {
-                    captureSucceeded = false
+                pendingCapture?.close()
+                pendingCapture = pending
+                try {
+                    shutterSound.play(MediaActionSound.SHUTTER_CLICK)
+                    session.stopRepeating()
+                    session.capture(captureBuilder.build(), pending, handler)
+                } catch (e: Exception) {
+                    pending.abort(e)
                 }
-
-                override fun onCaptureSequenceCompleted(session: CameraCaptureSession, sequenceId: Int, frameNumber: Long) {
-                    finishCapture(captureSucceeded)
-                }
-
-                override fun onCaptureSequenceAborted(session: CameraCaptureSession, sequenceId: Int) {
-                    finishCapture(false)
-                }
-            }, backgroundHandler)
+            }) {
+                finishCapture(IllegalStateException("Camera handler is not running."))
+            }
         } catch (e: Exception) {
             Log.e(TAG, "Capture failed", e)
-            finishCapture(false)
+            finishCapture(e)
         }
     }
 

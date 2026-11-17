@@ -48,12 +48,64 @@ internal class CaptureSequence {
     fun cancel() {
         val current = capture ?: return
         current.cancelled = true
-        // A submitted exposure must finish before another sequence is admitted.
+        // A submitted exposure and its save must finish before another sequence is admitted.
         if (!current.frameInProgress) capture = null
     }
 
     /** Only reset after closing the camera; old callbacks retain their old IDs. */
     fun reset() {
         capture = null
+    }
+}
+
+/** Joins camera termination and saving for one frame. Events must be serialized. */
+internal class CaptureCompletion(private val onComplete: (Exception?) -> Unit) {
+    var isComplete = false
+        private set
+
+    private var captured = false
+    private var cameraFinished = false
+    private var saved = false
+    private var error: Exception? = null
+
+    fun onCaptured() {
+        if (!isComplete) captured = true
+    }
+
+    fun onSaved() {
+        if (isComplete) return
+        saved = true
+        finishIfReady()
+    }
+
+    fun onFailed(error: Exception) {
+        if (isComplete) return
+        if (this.error == null) this.error = error
+        finishIfReady()
+    }
+
+    fun onCameraFinished() {
+        if (isComplete) return
+        cameraFinished = true
+        if (!captured && error == null) {
+            error = IllegalStateException("Capture completed without image metadata.")
+        }
+        finishIfReady()
+    }
+
+    fun abort(error: Exception) {
+        if (isComplete) return
+        cameraFinished = true
+        onFailed(error)
+    }
+
+    fun discard() {
+        isComplete = true
+    }
+
+    private fun finishIfReady() {
+        if (isComplete || !cameraFinished || (!saved && error == null)) return
+        isComplete = true
+        onComplete(error)
     }
 }
