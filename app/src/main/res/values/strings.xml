@@ -6,4 +6,5 @@
     <string name="cancel_capture">Cancel</string>
     <string name="cancel_capture_description">Cancel capture</string>
     <string name="capture_stopping">Stopping</string>
+    <string name="background_camera_unavailable">Background camera unavailable. Keep AstroCam visible and enable manual mode again.</string>
 </resources>

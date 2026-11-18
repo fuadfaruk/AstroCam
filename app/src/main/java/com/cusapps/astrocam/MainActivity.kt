@@ -2,8 +2,10 @@ package com.cusapps.astrocam
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.content.ServiceConnection
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
 import android.graphics.ImageFormat
@@ -39,8 +41,6 @@ import com.cusapps.astrocam.controls.ManualControlsState
 import com.cusapps.astrocam.databinding.ActivityMainBinding
 import com.google.android.material.slider.Slider
 import java.util.*
-import java.util.concurrent.Semaphore
-import java.util.concurrent.TimeUnit
 
 class MainActivity : AppCompatActivity() {
     private lateinit var viewBinding: ActivityMainBinding
@@ -54,7 +54,12 @@ class MainActivity : AppCompatActivity() {
     @Volatile private var imageReader: ImageReader? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
-    private val cameraOpenCloseLock = Semaphore(1)
+    private val cameraOwner = CameraOwner(CameraOwnership.Owner.ACTIVITY)
+    private var activityStarted = false
+    private var activityResumed = false
+    private var cameraService: CameraService? = null
+    private var serviceConnection: ServiceConnection? = null
+    private var backgroundSettings: Intent? = null
 
     private var cameraIndex = 0
     private var cameraIds = listOf<String>()
@@ -107,6 +112,7 @@ class MainActivity : AppCompatActivity() {
      */
     private val previewCaptureCallback = object : CameraCaptureSession.CaptureCallback() {
         override fun onCaptureCompleted(session: CameraCaptureSession, request: CaptureRequest, result: TotalCaptureResult) {
+            if (session !== captureSession) return
             val awbState = result.get(CaptureResult.CONTROL_AWB_STATE)
             if (awbState != null &&
                 awbState != CameraMetadata.CONTROL_AWB_STATE_CONVERGED &&
@@ -153,39 +159,21 @@ class MainActivity : AppCompatActivity() {
         override fun onSurfaceTextureSizeChanged(texture: SurfaceTexture, width: Int, height: Int) {
             updatePreviewTransform(width, height)
         }
-        override fun onSurfaceTextureDestroyed(texture: SurfaceTexture) = true
+        override fun onSurfaceTextureDestroyed(texture: SurfaceTexture): Boolean {
+            closeCamera()
+            return true
+        }
         override fun onSurfaceTextureUpdated(texture: SurfaceTexture) {}
-    }
-
-    private val stateCallback = object : CameraDevice.StateCallback() {
-        override fun onOpened(camera: CameraDevice) {
-            cameraOpenCloseLock.release()
-            cameraDevice = camera
-            createCameraPreviewSession()
-        }
-
-        override fun onDisconnected(camera: CameraDevice) {
-            cameraOpenCloseLock.release()
-            camera.close()
-            cameraDevice = null
-            captureHandler.post { if (cameraDevice == null) closeCamera() }
-        }
-
-        override fun onError(camera: CameraDevice, error: Int) {
-            cameraOpenCloseLock.release()
-            camera.close()
-            cameraDevice = null
-            captureHandler.post {
-                closeCamera()
-                finish()
-            }
-        }
     }
 
     override fun onStart() {
         super.onStart()
+        activityStarted = true
         userMinimized = false
-        stopCameraService()
+        backgroundSettings = null
+        if (serviceConnection == null) stopCameraService()
+        else cameraService?.pauseCamera()
+        mediaSession?.isActive = true
         startBackgroundThread()
         if (viewBinding.viewFinder.isAvailable) {
             openCamera(viewBinding.viewFinder.width, viewBinding.viewFinder.height)
@@ -194,39 +182,57 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    override fun onResume() {
+        super.onResume()
+        activityResumed = true
+        prepareCameraService()
+    }
+
+    override fun onPause() {
+        activityResumed = false
+        super.onPause()
+    }
+
     override fun onStop() {
-        if (controls.state.manualEnabled && !userMinimized && !isFinishing && !isChangingConfigurations) {
-            startCameraService()
-        }
+        activityStarted = false
+        backgroundSettings = if (controls.state.manualEnabled && !userMinimized &&
+            !isFinishing && !isChangingConfigurations && serviceConnection != null
+        ) cameraServiceSettings() else null
         closeCamera()
-        stopBackgroundThread()
+        val settings = backgroundSettings
+        if (settings != null) {
+            // The service already entered the foreground while this activity was visible.
+            // Its camera open waits for our CameraDevice.onClosed, not just close().
+            cameraService?.activateCamera(settings)
+            mediaSession?.isActive = false
+        } else {
+            stopCameraService()
+        }
         super.onStop()
     }
 
     private fun startBackgroundThread() {
+        if (backgroundThread != null) return
         backgroundThread = HandlerThread("CameraBackground").also { it.start() }
         backgroundHandler = Handler(backgroundThread!!.looper)
     }
 
     private fun stopBackgroundThread() {
         backgroundThread?.quitSafely()
-        try {
-            backgroundThread?.join()
-            backgroundThread = null
-            backgroundHandler = null
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "Interrupted while stopping background thread", e)
-        }
+        backgroundThread = null
+        backgroundHandler = null
     }
 
     private fun openCamera(width: Int, height: Int) {
+        if (!activityStarted || isFinishing || cameraOwner.isOpeningOrOpen ||
+            !viewBinding.viewFinder.isAvailable || backgroundHandler == null
+        ) return
         if (!allPermissionsGranted()) {
             ActivityCompat.requestPermissions(this, REQUIRED_PERMISSIONS, REQUEST_CODE_PERMISSIONS)
             return
         }
 
-        // Capture display metrics on the UI thread; createCameraPreviewSession()
-        // later runs on the background handler and must not touch views.
+        // Device/session state stays on the UI thread; image delivery and saving use the worker.
         displayRotation = windowManager.defaultDisplay.rotation
         windowManager.defaultDisplay.getSize(displaySize)
         viewFinderWidth = viewBinding.viewFinder.width
@@ -234,10 +240,6 @@ class MainActivity : AppCompatActivity() {
 
         val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         try {
-            if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
-                throw RuntimeException("Time out waiting to lock camera opening.")
-            }
-            
             cameraIds = manager.cameraIdList.toList()
             if (cameraIds.isEmpty()) return
             
@@ -276,10 +278,23 @@ class MainActivity : AppCompatActivity() {
             }
 
             updateManualControlsUI(characteristics)
-            manager.openCamera(cameraId!!, stateCallback, backgroundHandler)
+            prepareCameraService()
+            cameraOwner.open(manager, cameraId!!,
+                onOpened = { camera ->
+                    cameraDevice = camera
+                    createCameraPreviewSession()
+                },
+                onFailure = { error ->
+                    Log.e(TAG, "Failed to open camera", error)
+                    closeCamera()
+                    if (activityStarted) {
+                        Toast.makeText(this, "Camera unavailable: ${error.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to open camera", e)
-            cameraOpenCloseLock.release()
+            closeCamera()
         }
     }
 
@@ -386,11 +401,14 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
                 override fun onConfigureFailed(session: CameraCaptureSession) {
+                    if (device !== cameraDevice) return
+                    closeCamera()
                     Toast.makeText(this@MainActivity, "Failed to configure camera", Toast.LENGTH_SHORT).show()
                 }
-            }, backgroundHandler)
-        } catch (e: CameraAccessException) {
+            }, captureHandler)
+        } catch (e: Exception) {
             Log.e(TAG, "Camera access exception", e)
+            closeCamera()
         }
     }
 
@@ -408,35 +426,29 @@ class MainActivity : AppCompatActivity() {
 
     private fun closeCamera() {
         cancelCapture()
-        try {
-            cameraOpenCloseLock.acquire()
-            captureSession?.close()
-            captureSession = null
-            cameraDevice?.close()
-            cameraDevice = null
-            val reader = imageReader
-            imageReader = null
-            val cleanup = Runnable {
-                pendingCapture?.close()
-                pendingCapture = null
-                reader?.close()
-            }
-            val handler = backgroundHandler
-            if (handler == null) cleanup.run() else handler.post(cleanup)
-            latestAwbGains = null
-            captureSequence.reset()
-            updateCaptureUi()
-        } catch (e: InterruptedException) {
-            throw RuntimeException("Interrupted while trying to lock camera closing.", e)
-        } finally {
-            cameraOpenCloseLock.release()
+        captureSession?.close()
+        captureSession = null
+        cameraDevice = null
+        previewRequestBuilder = null
+        previewRequest = null
+        val reader = imageReader
+        imageReader = null
+        val cleanup = Runnable {
+            pendingCapture?.close()
+            pendingCapture = null
+            reader?.close()
         }
+        val handler = backgroundHandler
+        if (handler == null) cleanup.run() else handler.post(cleanup)
+        cameraOwner.close()
+        latestAwbGains = null
+        captureSequence.reset()
+        updateCaptureUi()
     }
 
-    private fun startCameraService() {
+    private fun cameraServiceSettings(): Intent {
         val whiteBalance = getWhiteBalanceSettings()
-        val intent = Intent(this, CameraService::class.java).apply {
-            action = CameraService.ACTION_UPDATE_SETTINGS
+        return Intent(this, CameraService::class.java).apply {
             putExtra(CameraService.EXTRA_MANUAL_MODE, controls.state.manualEnabled)
             putExtra(CameraService.EXTRA_RAW_MODE, viewBinding.rawModeSwitch.isChecked)
             putExtra(CameraService.EXTRA_ISO, getIso())
@@ -447,17 +459,58 @@ class MainActivity : AppCompatActivity() {
             putExtra(CameraService.EXTRA_WB_MANUAL_SUPPORTED, whiteBalance.manualGainsSupported)
             putExtra(CameraService.EXTRA_CAMERA_ID, cameraId)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            startForegroundService(intent)
-        } else {
-            startService(intent)
+    }
+
+    private fun prepareCameraService() {
+        if (!activityResumed || !controls.state.manualEnabled || cameraId == null ||
+            !allPermissionsGranted() || serviceConnection != null
+        ) return
+        val intent = Intent(this, CameraService::class.java).setAction(CameraService.ACTION_PREPARE)
+        val connection = object : ServiceConnection {
+            override fun onServiceConnected(name: ComponentName, binder: IBinder) {
+                if (serviceConnection !== this) return
+                val service = (binder as CameraService.LocalBinder).service
+                if (!service.isForegroundReady) {
+                    stopCameraService()
+                    return
+                }
+                cameraService = service
+                if (activityStarted) service.pauseCamera()
+                else backgroundSettings?.let { service.activateCamera(it) }
+            }
+
+            override fun onServiceDisconnected(name: ComponentName) {
+                if (serviceConnection !== this) return
+                stopCameraService()
+            }
+
+            override fun onBindingDied(name: ComponentName) = onServiceDisconnected(name)
+            override fun onNullBinding(name: ComponentName) = onServiceDisconnected(name)
         }
-        mediaSession?.isActive = false
+        try {
+            startForegroundService(intent)
+            if (bindService(intent, connection, Context.BIND_AUTO_CREATE)) {
+                serviceConnection = connection
+            } else {
+                stopCameraService()
+            }
+        } catch (e: RuntimeException) {
+            // CAMERA is while-in-use; a permission grant alone does not authorize a late start.
+            Log.e(TAG, "Background camera service could not be prepared", e)
+            stopCameraService()
+            Toast.makeText(this, R.string.background_camera_unavailable, Toast.LENGTH_LONG).show()
+        }
     }
 
     private fun stopCameraService() {
+        backgroundSettings = null
+        cameraService?.pauseCamera()
+        cameraService = null
+        val connection = serviceConnection
+        serviceConnection = null
+        if (connection != null) unbindService(connection)
         stopService(Intent(this, CameraService::class.java))
-        mediaSession?.isActive = true
+        mediaSession?.isActive = activityStarted
     }
 
     private fun takePhoto(onComplete: (Boolean) -> Unit) {
@@ -770,6 +823,7 @@ class MainActivity : AppCompatActivity() {
             updateManualControlEnabledState()
             applyCurrentSettingsToPreview()
             updateSettingsTexts()
+            if (isChecked) prepareCameraService() else stopCameraService()
         }
 
         // Infinity is a single tap; the wheel's top end is also a hard detent.
@@ -1134,7 +1188,15 @@ class MainActivity : AppCompatActivity() {
     private fun allPermissionsGranted() = REQUIRED_PERMISSIONS.all { ContextCompat.checkSelfPermission(baseContext, it) == PackageManager.PERMISSION_GRANTED }
 
     override fun onDestroy() {
-        cancelCapture()
+        closeCamera()
+        if (backgroundSettings != null && cameraService?.isForegroundReady == true) {
+            serviceConnection?.let { unbindService(it) }
+            serviceConnection = null
+            cameraService = null
+        } else {
+            stopCameraService()
+        }
+        stopBackgroundThread()
         super.onDestroy()
         mediaSession?.release()
         captureHandler.removeCallbacksAndMessages(null)

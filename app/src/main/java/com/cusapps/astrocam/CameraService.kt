@@ -1,6 +1,5 @@
 package com.cusapps.astrocam
 
-import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -18,12 +17,9 @@ import android.support.v4.media.session.MediaSessionCompat
 import android.support.v4.media.session.PlaybackStateCompat
 import android.util.Log
 import android.view.KeyEvent
-import androidx.annotation.RequiresPermission
 import androidx.core.app.NotificationCompat
 import androidx.media.session.MediaButtonReceiver
 import java.util.*
-import java.util.concurrent.Semaphore
-import java.util.concurrent.TimeUnit
 
 /**
  * CameraService is a Foreground Service that allows the app to keep the camera active
@@ -53,10 +49,18 @@ class CameraService : Service() {
     @Volatile private var imageReader: ImageReader? = null
     private var backgroundThread: HandlerThread? = null
     private var backgroundHandler: Handler? = null
-    private val cameraOpenCloseLock = Semaphore(1)
+    private val cameraOwner = CameraOwner(CameraOwnership.Owner.SERVICE)
     private val captureSequence = CaptureSequence()
     private val mainHandler = Handler(Looper.getMainLooper())
     private var isStopping = false
+    internal var isForegroundReady = false
+        private set
+    private var isPrepared = false
+    private val binder = LocalBinder()
+
+    internal inner class LocalBinder : Binder() {
+        val service: CameraService get() = this@CameraService
+    }
     private val notificationReset = Runnable {
         updateNotification(
             if (captureSession == null) "Camera not ready."
@@ -72,7 +76,7 @@ class CameraService : Service() {
         private const val CHANNEL_ID = "CameraServiceChannel"
         private const val NOTIFICATION_ID = 1
         
-        const val ACTION_UPDATE_SETTINGS = "com.cusapps.astrocam.UPDATE_SETTINGS"
+        const val ACTION_PREPARE = "com.cusapps.astrocam.PREPARE_CAMERA"
         const val ACTION_CANCEL_CAPTURE = "com.cusapps.astrocam.CANCEL_CAPTURE"
         const val EXTRA_MANUAL_MODE = "extra_manual_mode"
         const val EXTRA_RAW_MODE = "extra_raw_mode"
@@ -97,10 +101,17 @@ class CameraService : Service() {
         
         shutterSound.load(MediaActionSound.SHUTTER_CLICK)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
-        } else {
-            startForeground(NOTIFICATION_ID, notification)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                startForeground(NOTIFICATION_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_CAMERA)
+            } else {
+                startForeground(NOTIFICATION_ID, notification)
+            }
+            isForegroundReady = true
+        } catch (e: RuntimeException) {
+            Log.e(TAG, "Camera foreground service is not allowed", e)
+            stopSelf()
+            return
         }
         
         startBackgroundThread()
@@ -114,62 +125,68 @@ class CameraService : Service() {
 
     private fun stopBackgroundThread() {
         backgroundThread?.quitSafely()
-        try {
-            backgroundThread?.join()
-            backgroundThread = null
-            backgroundHandler = null
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "Interrupted while stopping background thread", e)
-        }
+        backgroundThread = null
+        backgroundHandler = null
     }
 
-    @RequiresPermission(Manifest.permission.CAMERA)
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (intent?.action == ACTION_CANCEL_CAPTURE) {
-            // A stale notification action can start a new, uninitialized service.
-            if (currentCameraId == null) stopSelfResult(startId)
-            else cancelCapture()
+        if (!isForegroundReady) {
+            stopSelfResult(startId)
             return START_NOT_STICKY
         }
-        if (intent?.action == ACTION_UPDATE_SETTINGS) {
-            manualMode = intent.getBooleanExtra(EXTRA_MANUAL_MODE, false)
-            rawMode = intent.getBooleanExtra(EXTRA_RAW_MODE, false)
-            iso = intent.getIntExtra(EXTRA_ISO, 400)
-            shutterSpeed = intent.getLongExtra(EXTRA_SHUTTER, 1_000_000_000L)
-            focusDistance = intent.getFloatExtra(EXTRA_FOCUS, 0f)
-
-            // The service has no preview, so its AWB never converges on its own. The
-            // locked gains must come across from the activity to keep background
-            // frames colour-matched to the rest of the sequence.
-            whiteBalance = CameraUtils.WhiteBalance(
-                locked = intent.getBooleanExtra(EXTRA_WB_LOCKED, false),
-                temperatureK = intent.getIntExtra(EXTRA_WB_TEMPERATURE, CameraUtils.WB_DEFAULT_TEMPERATURE_K),
-                manualGainsSupported = intent.getBooleanExtra(EXTRA_WB_MANUAL_SUPPORTED, false)
-            )
-            
-            val newCameraId = intent.getStringExtra(EXTRA_CAMERA_ID)
-            
-            if (newCameraId != null && newCameraId != currentCameraId) {
-                currentCameraId = newCameraId
-                closeCamera()
-                openCamera()
-            }
-
-            Log.d(TAG, "Settings updated: Manual=$manualMode, RAW=$rawMode, ISO=$iso, Shutter=$shutterSpeed, WBLocked=${whiteBalance.locked}, WBTemp=${whiteBalance.temperatureK}")
+        if (intent?.action == ACTION_PREPARE) {
+            isPrepared = true
+            return START_NOT_STICKY
+        }
+        if (!isPrepared) {
+            // Neither a restart nor a stale notification/media action may open the camera.
+            stopSelfResult(startId)
+            return START_NOT_STICKY
+        }
+        if (intent?.action == ACTION_CANCEL_CAPTURE) {
+            cancelCapture()
+            return START_NOT_STICKY
         }
         MediaButtonReceiver.handleIntent(mediaSession, intent)
         return START_NOT_STICKY
     }
 
-    @RequiresPermission(Manifest.permission.CAMERA)
+    internal fun activateCamera(intent: Intent) {
+        if (!isForegroundReady || isStopping) return
+        closeCamera()
+        manualMode = intent.getBooleanExtra(EXTRA_MANUAL_MODE, false)
+        rawMode = intent.getBooleanExtra(EXTRA_RAW_MODE, false)
+        iso = intent.getIntExtra(EXTRA_ISO, 400)
+        shutterSpeed = intent.getLongExtra(EXTRA_SHUTTER, 1_000_000_000L)
+        focusDistance = intent.getFloatExtra(EXTRA_FOCUS, 0f)
+
+        // The service has no preview, so its AWB never converges on its own. The
+        // locked gains must come across from the activity to keep background
+        // frames colour-matched to the rest of the sequence.
+        whiteBalance = CameraUtils.WhiteBalance(
+            locked = intent.getBooleanExtra(EXTRA_WB_LOCKED, false),
+            temperatureK = intent.getIntExtra(EXTRA_WB_TEMPERATURE, CameraUtils.WB_DEFAULT_TEMPERATURE_K),
+            manualGainsSupported = intent.getBooleanExtra(EXTRA_WB_MANUAL_SUPPORTED, false)
+        )
+
+        currentCameraId = intent.getStringExtra(EXTRA_CAMERA_ID)
+        mediaSession?.isActive = true
+        openCamera()
+
+        Log.d(TAG, "Settings updated: Manual=$manualMode, RAW=$rawMode, ISO=$iso, Shutter=$shutterSpeed, WBLocked=${whiteBalance.locked}, WBTemp=${whiteBalance.temperatureK}")
+    }
+
+    internal fun pauseCamera() {
+        mediaSession?.isActive = false
+        closeCamera()
+        updateNotification("Background mode armed; using app preview.")
+    }
+
     private fun openCamera() {
+        if (isStopping || !isForegroundReady || cameraOwner.isOpeningOrOpen) return
         val cid = currentCameraId ?: return
         val manager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
         try {
-            if (!cameraOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
-                return
-            }
-            
             val characteristics = manager.getCameraCharacteristics(cid)
             val map = characteristics.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)!!
             
@@ -198,28 +215,21 @@ class CameraService : Service() {
                 }, backgroundHandler)
             }
 
-            manager.openCamera(cid, object : CameraDevice.StateCallback() {
-                override fun onOpened(camera: CameraDevice) {
-                    cameraOpenCloseLock.release()
+            cameraOwner.open(manager, cid,
+                onOpened = { camera ->
                     cameraDevice = camera
                     createCaptureSession()
+                },
+                onFailure = { error ->
+                    Log.e(TAG, "Failed to open camera in service", error)
+                    closeCamera()
+                    updateNotification("Background camera unavailable: ${error.message}")
                 }
-                override fun onDisconnected(camera: CameraDevice) {
-                    cameraOpenCloseLock.release()
-                    camera.close()
-                    cameraDevice = null
-                    mainHandler.post { if (cameraDevice == null) closeCamera() }
-                }
-                override fun onError(camera: CameraDevice, error: Int) {
-                    cameraOpenCloseLock.release()
-                    camera.close()
-                    cameraDevice = null
-                    mainHandler.post { if (cameraDevice == null) closeCamera() }
-                }
-            }, backgroundHandler)
+            )
         } catch (e: Exception) {
             Log.e(TAG, "Failed to open camera in service", e)
-            cameraOpenCloseLock.release()
+            closeCamera()
+            updateNotification("Background camera unavailable: ${e.message}")
         }
     }
 
@@ -234,48 +244,44 @@ class CameraService : Service() {
                         return
                     }
                     captureSession = session
-                    mainHandler.post {
-                        if (captureSession === session && !captureSequence.isCaptureInProgress) {
-                            mainHandler.removeCallbacks(notificationReset)
-                            updateNotification("Ready to capture even when screen is off")
-                        }
+                    if (!captureSequence.isCaptureInProgress) {
+                        mainHandler.removeCallbacks(notificationReset)
+                        updateNotification("Ready to capture even when screen is off")
                     }
                 }
                 override fun onConfigureFailed(session: CameraCaptureSession) {
+                    if (device !== cameraDevice) return
                     Log.e(TAG, "Failed to configure capture session")
+                    closeCamera()
+                    updateNotification("Background camera configuration failed.")
                 }
-            }, backgroundHandler)
-        } catch (e: CameraAccessException) {
+            }, mainHandler)
+        } catch (e: Exception) {
             Log.e(TAG, "Failed to create capture session", e)
+            closeCamera()
+            updateNotification("Background camera configuration failed: ${e.message}")
         }
     }
 
     private fun closeCamera() {
         captureSequence.cancel()
         mainHandler.removeCallbacks(notificationReset)
-        try {
-            cameraOpenCloseLock.acquire()
-            captureSession?.close()
-            captureSession = null
-            cameraDevice?.close()
-            cameraDevice = null
-            val reader = imageReader
-            imageReader = null
-            val cleanup = Runnable {
-                pendingCapture?.close()
-                pendingCapture = null
-                reader?.close()
-            }
-            val handler = backgroundHandler
-            if (handler == null) cleanup.run() else handler.post(cleanup)
-            captureSequence.reset()
-            if (wakeLock?.isHeld == true) wakeLock?.release()
-            updateNotification("Camera not ready.")
-        } catch (e: InterruptedException) {
-            Log.e(TAG, "Interrupted while closing camera", e)
-        } finally {
-            cameraOpenCloseLock.release()
+        captureSession?.close()
+        captureSession = null
+        cameraDevice = null
+        val reader = imageReader
+        imageReader = null
+        val cleanup = Runnable {
+            pendingCapture?.close()
+            pendingCapture = null
+            reader?.close()
         }
+        val handler = backgroundHandler
+        if (handler == null) cleanup.run() else handler.post(cleanup)
+        cameraOwner.close()
+        captureSequence.reset()
+        if (wakeLock?.isHeld == true) wakeLock?.release()
+        updateNotification("Camera not ready.")
     }
 
     private fun initializeMediaSession() {
@@ -300,7 +306,7 @@ class CameraService : Service() {
                 .setActions(PlaybackStateCompat.ACTION_PLAY or PlaybackStateCompat.ACTION_PAUSE or PlaybackStateCompat.ACTION_STOP)
                 .setState(PlaybackStateCompat.STATE_PLAYING, 0, 1.0f)
                 .build())
-            isActive = true
+            isActive = false
         }
     }
 
@@ -399,6 +405,7 @@ class CameraService : Service() {
 
     override fun onDestroy() {
         isStopping = true
+        isForegroundReady = false
         super.onDestroy()
         closeCamera()
         stopBackgroundThread()
@@ -408,7 +415,7 @@ class CameraService : Service() {
         shutterSound.release()
     }
 
-    override fun onBind(intent: Intent?) = null
+    override fun onBind(intent: Intent?): IBinder = binder
 
     private class CompareSizesByArea : Comparator<android.util.Size> {
         override fun compare(lhs: android.util.Size, rhs: android.util.Size): Int =
